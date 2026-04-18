@@ -1,0 +1,9 @@
+# running experiments
+mlflow-skinny==3.5.1
+numpy
+pandas
+lamarr-energy-tracker
+# analysis
+pillow
+plotly==5.24.1
+tqdm

@@ -1,0 +1,10 @@
+name: ollama
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - mlflow
+      - ollama
+      - pandas
+      - codecarbon
+      - lamarr-energy-tracker
