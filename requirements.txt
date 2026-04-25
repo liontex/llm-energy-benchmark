@@ -1,7 +1,9 @@
-# running experiments
-mlflow-skinny==3.5.1
+# dataset
 numpy
 pandas
+datasets
+# running experiments
+mlflow-skinny==3.5.1
 lamarr-energy-tracker
 # analysis
 pillow

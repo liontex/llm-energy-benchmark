@@ -124,3 +124,7 @@ dmypy.json
 .pyre/
 
 .DS_Store
+
+# Datasets and variations of them
+dataset/dataset_samples
+dataset/hf_cache
