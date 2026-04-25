@@ -2,6 +2,7 @@
 numpy
 pandas
 datasets
+ollama
 # running experiments
 mlflow-skinny==3.5.1
 lamarr-energy-tracker
