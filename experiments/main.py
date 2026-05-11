@@ -12,13 +12,12 @@ from util import get_gpu_name, get_processor_name, print_colored_block
 
 def read_queries(random=True):
     conversations = pd.read_json(
-        path_or_buf=os.path.join(os.path.dirname(__file__), "Pure-Dove.jsonl"),
+        path_or_buf=os.path.join(os.path.dirname(__file__), "../dataset/dataset_samples/LDJnr_Pure-Dove_train_n10_seed30_modelgemma3_27b_flagssfa.jsonl"),
         lines=True,
     )
-    conversations.set_index("id", inplace=True)
     if random:
         conversations = conversations.sample(frac=1)
-    return [conv[0]["value"] for conv in conversations["conversations"]]
+    return conversations
 
 
 if __name__ == "__main__":
@@ -83,11 +82,11 @@ if __name__ == "__main__":
         f"STARTING ENERGY PROFILING FOR   {args.model.upper()}   temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}"
     )
     # run inference
-    for query in queries:
+    for index, query in queries.iterrows():
         t0 = time.time()
         resp = ollama.chat(
             model=args.model,
-            messages=[{"role": "user", "content": query}],
+            messages=[{"role": "user", "content": query["input"]}],
             options={"temperature": args.temperature},
         )
         try:

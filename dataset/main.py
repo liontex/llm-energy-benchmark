@@ -5,13 +5,13 @@ import ollama
 from datasets import load_dataset, load_from_disk
 
 
-def build_cache_path(base_dir, dataset, split, seed, num_samples, model, simple, friendly, academic):
+def build_cache_path(base_dir, dataset, split, seed, num_samples, model, temperature, simple, friendly, academic):
     simple = "s" if simple else ""
     friendly = "f" if friendly else ""
     academic = "a" if academic else ""
     dataset_safe = dataset.replace("/", "_")
     model_safe = model.replace("/", "_").replace(":", "_")
-    return os.path.join(base_dir, f"{dataset_safe}_{split}_n{num_samples}_seed{seed}_model{model_safe}_flags{simple}{friendly}{academic}")
+    return os.path.join(base_dir, f"{dataset_safe}_{split}_n{num_samples}_seed{seed}_model{model_safe}_temperature{temperature}_flags{simple}{friendly}{academic}")
 
 
 def extract_input(row):
@@ -240,22 +240,22 @@ def main():
     args = parser.parse_args()
 
     sample_cache_path = build_cache_path(
-        args.sample_cache_dir, args.dataset, args.split, args.seed, args.num_samples, args.model, args.simple, args.friendly, args.academic
+        args.sample_cache_dir, args.dataset, args.split, args.seed, args.num_samples, args.model, args.temperature, args.simple, args.friendly, args.academic
     )
 
     if (not args.force) & (args.seed is not None) & os.path.exists(sample_cache_path):
-        print(f"Lade vorhandenen Sample-Cache: {sample_cache_path}")
+        print(f"Load existing Sample-Cache: {sample_cache_path}")
         dataset = load_from_disk(sample_cache_path)
     else:
-        print("Lade LLM von Ollama...")
+        print("Load LLM from Ollama...")
         ollama.pull(args.model)
 
-        print("Lade Dataset von Hugging Face...")
+        print("Load Dataset from Hugging Face...")
         dataset = load_dataset(
             args.dataset, split=args.split, cache_dir=args.hf_cache_dir
         )
 
-        print("Erzeuge reproduzierbare Zufallsstichprobe...")
+        print("Select samples...")
         if args.seed:
             dataset = dataset.shuffle(seed=args.seed).select(range(args.num_samples))
         else:
@@ -264,17 +264,19 @@ def main():
         dataset = dataset.map(extract_input)
         dataset = dataset.select_columns("input")
         
+        print("Classify samples...")
         if args.classify:
             dataset = dataset.map(
                 lambda row: classify(row, args.model, args.temperature)
             )
 
+        print("Generate reformulations...")
         dataset = dataset.map(
             lambda row: reformulation(row, args.model, args.temperature, args.simple, args.friendly, args.academic, args.verbose)
         )
 
+        print(f"Save Sample-Cache: {sample_cache_path}")
         os.makedirs(sample_cache_path, exist_ok=True)
-        print(f"Speichere Sample-Cache: {sample_cache_path}")
         dataset.save_to_disk(sample_cache_path)
         dataset.to_json(f"{sample_cache_path}.jsonl")
 
