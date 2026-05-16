@@ -11,7 +11,7 @@ def build_cache_path(base_dir, dataset, split, seed, num_samples, model, tempera
     academic = "a" if academic else ""
     dataset_safe = dataset.replace("/", "_")
     model_safe = model.replace("/", "_").replace(":", "_")
-    return os.path.join(base_dir, f"{dataset_safe}_{split}_n{num_samples}_seed{seed}_model{model_safe}_temperature{temperature}_flags{simple}{friendly}{academic}")
+    return os.path.join(base_dir, f"{dataset_safe}_split{split}_n{num_samples}_seed{seed}_model{model_safe}_temperature{temperature}_flags{simple}{friendly}{academic}")
 
 
 def extract_input(row):

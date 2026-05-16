@@ -2,6 +2,7 @@ import subprocess
 import platform
 import re
 import time
+import os
     
 def print_colored_block(message, ok=True, rows=6, row_length=80):
     col = '\033[92m' if ok else '\033[91m'
@@ -51,3 +52,26 @@ def get_gpu_name():
         return None
 
     return None
+
+def infos_from_dataset_path(path):
+    file = os.path.basename(path)
+    dataset, rest = split_next(file, "_split")
+    split, rest = split_next(rest, "_n")
+    n, rest = split_next(rest, "_seed")
+    seed, rest = split_next(rest, "_model")
+    model, rest = split_next(rest, "_temperature")
+    temperature, rest = split_next(rest, "_flags")
+    flags, rest = split_next(rest, ".jsonl")
+    return {
+        "dataset_path": path,
+        "dataset_filename": file,
+        "dataset": dataset,
+        "dataset_split": split,
+        "dataset_n_samples": n,
+        "dataset_temperature": temperature,
+        "dataset_flags": flags
+    }
+
+def split_next(rest, separator):
+    rest = rest.split(separator, 1)
+    return (rest[0], rest[1])

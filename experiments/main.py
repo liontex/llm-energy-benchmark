@@ -7,16 +7,16 @@ import mlflow
 import numpy as np
 import pandas as pd
 from lamarr_energy_tracker import EnergyTracker, GroundTruthTracker
-from util import get_gpu_name, get_processor_name, print_colored_block
+from util import get_gpu_name, get_processor_name, print_colored_block, infos_from_dataset_path
 
 
-def read_queries(random=True):
+def read_queries(dataset_path, random=True, seed=None):
     conversations = pd.read_json(
-        path_or_buf=os.path.join(os.path.dirname(__file__), "../dataset/dataset_samples/LDJnr_Pure-Dove_train_n10_seed30_modelgemma3_27b_flagssfa.jsonl"),
+        path_or_buf=os.path.join(os.path.dirname(__file__), dataset_path),
         lines=True,
     )
     if random:
-        conversations = conversations.sample(frac=1)
+        conversations = conversations.sample(frac=1, random_state=seed)
     return conversations
 
 
@@ -31,9 +31,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seconds",
         type=int,
-        default=60,
+        default=0,
         help="number of seconds to profile model on a subset of the data -- 0 process complete",
     )
+    parser.add_argument("-d", "--dataset", help="path to the dataset")
+    parser.add_argument("-f", "--field", default="input")
+    parser.add_argument("-s", "--seed", type=int, help="Seed for shuffling dataset before running the experiment")
+
     args = parser.parse_args()
     mlflow.log_dict(args.__dict__, "config.json")
     tracker = EnergyTracker()
@@ -43,11 +47,14 @@ if __name__ == "__main__":
     params = {
         "model": args.model,
         "temperature": args.temperature,
-        "dataset": "LLM Benchmark (PureDove)",
         "task": "Inference",
         "architecture": get_processor_name() if args.nogpu else get_gpu_name(),
     }
     for key, val in params.items():
+        mlflow.log_param(key, val)
+
+    dataset_infos = infos_from_dataset_path(args.dataset)
+    for key, val in dataset_infos.items():
         mlflow.log_param(key, val)
 
     # if required, disable gpu
@@ -55,7 +62,7 @@ if __name__ == "__main__":
         os.environ["OLLAMA_NO_GPU"] = "1"
 
     # load data
-    queries = read_queries()
+    queries = read_queries(args.dataset, seed=args.seed)
 
     # delete old models (for freeing disk space), load new model and its meta info, init inference (often has some temporal overhead)
     import ollama
