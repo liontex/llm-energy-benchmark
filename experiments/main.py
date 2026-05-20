@@ -63,6 +63,7 @@ if __name__ == "__main__":
 
     # load data
     queries = read_queries(args.dataset, seed=args.seed)
+    queries[args.field]
 
     # delete old models (for freeing disk space), load new model and its meta info, init inference (often has some temporal overhead)
     import ollama
@@ -86,7 +87,7 @@ if __name__ == "__main__":
     ground_tracker.start()
     tracker.start()
     print_colored_block(
-        f"STARTING ENERGY PROFILING FOR   {args.model.upper()}   temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}"
+        f"STARTING ENERGY PROFILING FOR   {args.model.upper()}   temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos.dataset_name} in {args.field} formulation"
     )
     # run inference
     for index, query in queries.iterrows():
@@ -116,13 +117,13 @@ if __name__ == "__main__":
         if args.seconds and remaining < 0:
             break
     print_colored_block(
-        f"STOPPING ENERGY PROFILING FOR   {args.model.upper()}  temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}",
+        f"STOPPING ENERGY PROFILING FOR   {args.model.upper()}  temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos.dataset_name} in {args.field} formulation",
         ok=False,
     )
     tracker.stop()
     ground_results = ground_tracker.stop()
 
-    # add average amount of tokens if there we any errors:
+    # add average amount of tokens if there were any errors:
     tokens["in"] += [np.mean(tokens["in"])] * (n_samples - len(tokens["in"]))
     tokens["out"] += [np.mean(tokens["out"])] * (n_samples - len(tokens["in"]))
 
