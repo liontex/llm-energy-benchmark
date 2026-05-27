@@ -128,3 +128,4 @@ dmypy.json
 # Datasets and variations of them
 dataset/dataset_samples
 dataset/hf_cache
+experiments/mlruns/
