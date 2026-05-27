@@ -63,7 +63,6 @@ def infos_from_dataset_path(path):
     temperature, rest = split_next(rest, "_flags")
     flags, rest = split_next(rest, ".jsonl")
     return {
-        "dataset_filename": file,
         "dataset_name": dataset,
         "dataset_split": split,
         "dataset_n_samples": n,

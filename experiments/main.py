@@ -87,7 +87,7 @@ if __name__ == "__main__":
     ground_tracker.start()
     tracker.start()
     print_colored_block(
-        f"STARTING ENERGY PROFILING FOR   {args.model.upper()}   temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos.dataset_name} in {args.field} formulation"
+        f"STARTING ENERGY PROFILING FOR   {args.model.upper()}   temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos["dataset_name"]} in {args.field} formulation"
     )
     # run inference
     for index, query in queries.iterrows():
@@ -117,7 +117,7 @@ if __name__ == "__main__":
         if args.seconds and remaining < 0:
             break
     print_colored_block(
-        f"STOPPING ENERGY PROFILING FOR   {args.model.upper()}  temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos.dataset_name} in {args.field} formulation",
+        f"STOPPING ENERGY PROFILING FOR   {args.model.upper()}  temperature {args.temperature} on   {'CPU' if args.nogpu else 'GPU'}   with dataset {dataset_infos["dataset_name"]} in {args.field} formulation",
         ok=False,
     )
     tracker.stop()
