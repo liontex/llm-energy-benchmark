@@ -4,7 +4,7 @@ pandas
 datasets
 ollama
 # running experiments
-mlflow-skinny==3.5.1
+mlflow
 lamarr-energy-tracker
 # analysis
 pillow
