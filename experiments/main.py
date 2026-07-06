@@ -9,6 +9,9 @@ import pandas as pd
 from lamarr_energy_tracker import EnergyTracker, GroundTruthTracker
 from lamarr_energy_tracker.tracker import delete_results
 from util import get_gpu_name, get_processor_name, print_colored_block, infos_from_dataset_path
+import ollama
+from llama_cpp import Llama
+from huggingface_hub import scan_cache_dir
 
 
 def read_queries(dataset_path, random=True, seed=None):
@@ -18,8 +21,49 @@ def read_queries(dataset_path, random=True, seed=None):
     )
     if random:
         conversations = conversations.sample(frac=1, random_state=seed)
-        print(conversations)
     return conversations
+
+def load_model(args):
+    if args.backend == "ollama":
+        # Cleanup of old model before pulling new one
+        if len(ollama.list().models) > 0:
+            if len(ollama.list().models) > 1 or ollama.list().models[0].model != args.model:
+                for mod in ollama.list().models:
+                    ollama.delete(mod.model)
+        
+        ollama.pull(args.model)
+        return ollama.Client(host='http://localhost:11434', timeout=args.timeout)
+    elif args.backend == "llama.cpp":
+        return Llama.from_pretrained(args.model, "*Q4_K_M.gguf", verbose=False, n_ctx=0, n_gpu_layers=-1, seed=args.seed)
+    else:
+        raise ValueError(f"Invalid Backend choice: {args.backend}, only ollama and llama.cpp supported")
+
+def chat(client, message, args):
+    messages = [{"role": "user", "content": message}]
+
+    if args.backend == "ollama":
+        return client.chat(
+            model=args.model,
+            messages=messages,
+            options={"temperature": args.temperature, "seed": args.seed},
+            keep_alive=f"{args.timeout}s"
+        )
+    elif args.backend == "llama.cpp":
+        return client.create_chat_completion(messages=messages, temperature=args.temperature, seed=args.seed)
+    else:
+        raise ValueError(f"Invalid Backend choice: {args.backend}, only ollama and llama.cpp supported")
+
+def get_token(response, args):
+    if args.backend == "ollama":
+        token_in = response["prompt_eval_count"]
+        token_out = response["eval_count"]
+    elif args.backend == "llama.cpp":
+        token_in = response["usage"]["prompt_tokens"]
+        token_out = response["usage"]["completion_tokens"]
+    else:
+        raise ValueError(f"Invalid Backend choice: {args.backend}, only ollama and llama.cpp supported")
+
+    return (token_in, token_out)
 
 
 if __name__ == "__main__":
@@ -38,6 +82,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--dataset", help="path to the dataset")
     parser.add_argument("-f", "--field", default="input")
+    parser.add_argument("-b", "--backend", default="ollama")
+    parser.add_argument("-t", "--timeout", type=int, help="Timeout per prompt (in seconds), default is 10m)", default=600)
     parser.add_argument("-s", "--seed", type=int, help="Seed for shuffling dataset before running the experiment")
 
     args = parser.parse_args()
@@ -69,20 +115,10 @@ if __name__ == "__main__":
     queries[args.field]
 
     # delete old models (for freeing disk space), load new model and its meta info, init inference (often has some temporal overhead)
-    import ollama
-
-    if len(ollama.list().models) > 0:
-        if len(ollama.list().models) > 1 or ollama.list().models[0].model != args.model:
-            for mod in ollama.list().models:
-                ollama.delete(mod.model)
-
-    print(f"Pull model {args.model}...")
-    ollama.pull(args.model)
+    print(f"Pull model {args.model} by backend {args.backend}...")
+    client = load_model(args)
     print(f"Model successfully pulled. Testing Inference...")
-    resp = ollama.chat(
-        model=args.model,
-        messages=[{"role": "user", "content": f"Can you answer questions?"}],
-    )
+    resp = chat(client, "Can you answer questions?", args)
     print(f"Inference successfully tested.")
     mlflow.log_param("file_size", ollama.list().models[0].size)
     mlflow.log_param("parameters", ollama.list().models[0].details.parameter_size)
@@ -94,6 +130,8 @@ if __name__ == "__main__":
 
     # run evaluations but watch for time limit
     times, n_samples, tokens = [], 0, {"in": [], "out": []}
+    failed_prompts, failed_time = 0, 0
+    keep_alive = args.seconds if args.seconds or args.seconds <= 0 else 600
 
     print("Start Energy Tracking...")
     # evaluate queries
@@ -110,19 +148,22 @@ if __name__ == "__main__":
     # run inference
     for index, query in queries.iterrows():
         t0 = time.time()
-        resp = ollama.chat(
-            model=args.model,
-            messages=[{"role": "user", "content": query[args.field]}],
-            options={"temperature": args.temperature, "seed": args.seed},
-            keep_alive="10m"
-        )
         try:
-            tokens["in"].append(resp["prompt_eval_count"])
-            tokens["out"].append(resp["eval_count"])
+            response = chat(client, query[args.field], args)
+            t1 = time.time()
+        except:
+            t1 = time.time()
+            failed_prompts += 1
+            failed_time += t1 - t0
+
+        try:
+            token_in, token_out = get_token(response, args)
+            tokens["in"].append(token_in)
+            tokens["out"].append(token_out)
         except:
             pass
-        times.append(time.time() - t0)
         n_samples += 1
+        times.append(t1 - t0)
         remaining = (
             args.seconds - sum(times)
             if args.seconds and len(times) < 5
@@ -152,6 +193,8 @@ if __name__ == "__main__":
     results = {
         "n_tokens_in": sum(tokens["in"]),
         "n_tokens_out": sum(tokens["out"]),
+        "n_failed_prompts": failed_prompts,
+        "failed_time": failed_time,
         "running_time_total": code_carbon_results["duration"],
         "running_time": code_carbon_results["duration"] / n_samples,
         "power_draw_total": code_carbon_results["energy_consumed"] * 3.6e6,

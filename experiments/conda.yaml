@@ -5,6 +5,8 @@ dependencies:
   - pip:
       - mlflow
       - ollama
+      - llama-cpp-python
+      - huggingface-hub
       - pandas
       - codecarbon
       - lamarr-energy-tracker

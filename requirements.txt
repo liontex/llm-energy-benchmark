@@ -3,6 +3,8 @@ numpy
 pandas
 datasets
 ollama
+llama-cpp-python
+huggingface-hub
 # running experiments
 mlflow
 lamarr-energy-tracker
