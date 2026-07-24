@@ -8,19 +8,22 @@ echo $exp_create_str
 exp_id=$(echo $exp_create_str | awk '{print $NF}')
 
 # Define model architectures to iterate over # replace 8b with 14b
-models=("gemma3:4b"  "gemma4:e4b" "gemma4:31b"
+models=("gemma3:4b"  "gemma4:e4b"
         "tinyllama:1.1b" # "llama4:scout"
         "mistral:7b" # "magistral:24b"
+        "gemma4:31b"
         )
 
 #dataset="../dataset/dataset_samples/LDJnr_Pure-Dove_splittrain_n1_seedNone_modelgemma3_27b_temperature0.5_flagssfa.jsonl"
 #dataset="../dataset/dataset_samples/LDJnr_Pure-Dove_splittrain_n10_seed30_modelgemma3_27b_temperature0.5_flagssfa.jsonl"
-dataset="../dataset/dataset_samples/LDJnr_Pure-Dove_splittrain_n100_seed30_modelgemma3_27b_temperature0.5_flagssfa.jsonl"
+#dataset="../dataset/dataset_samples/LDJnr_Pure-Dove_splittrain_n100_seed30_modelgemma3_27b_temperature0.5_flagssfa.jsonl"
+dataset="../dataset/dataset_samples/LDJnr_Pure-Dove_splittrain_n1000_seed50_modelgemma3_27b_temperature0.5_flagssfa.jsonl"
 
 backend="ollama"
-timeout=300
+timeout=900
 
-seed=$(awk -v min=1 -v max=10000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+#seed=$(awk -v min=1 -v max=10000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+seed=9936
 echo "Seed for randomization operations: $seed"
 
 

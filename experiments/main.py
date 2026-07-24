@@ -68,7 +68,7 @@ def get_token(response, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Inference benchmarking with ollama LLMs"
+        description="Inference benchmarking with LLMs"
     )
     # data and model input
     parser.add_argument("--model", default="gemma3:1b")
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dataset", help="path to the dataset")
     parser.add_argument("-f", "--field", default="input")
     parser.add_argument("-b", "--backend", default="ollama")
-    parser.add_argument("-t", "--timeout", type=int, help="Timeout per prompt (in seconds), default is 10m)", default=600)
+    parser.add_argument("-t", "--timeout", type=int, help="Timeout per prompt (in seconds), default is 10m)", default=1200)
     parser.add_argument("-s", "--seed", type=int, help="Seed for shuffling dataset before running the experiment")
 
     args = parser.parse_args()
@@ -151,17 +151,16 @@ if __name__ == "__main__":
         try:
             response = chat(client, query[args.field], args)
             t1 = time.time()
+            token_in, token_out = get_token(response, args)
         except:
             t1 = time.time()
             failed_prompts += 1
             failed_time += t1 - t0
+            token_in = 0
+            token_out = 0
 
-        try:
-            token_in, token_out = get_token(response, args)
-            tokens["in"].append(token_in)
-            tokens["out"].append(token_out)
-        except:
-            pass
+        tokens["in"].append(token_in)
+        tokens["out"].append(token_out)
         n_samples += 1
         times.append(t1 - t0)
         remaining = (
@@ -182,10 +181,6 @@ if __name__ == "__main__":
     )
     code_carbon_results = tracker.stop()
     ground_results = ground_tracker.stop()
-
-    # add average amount of tokens if there were any errors:
-    tokens["in"] += [np.mean(tokens["in"])] * (n_samples - len(tokens["in"]))
-    tokens["out"] += [np.mean(tokens["out"])] * (n_samples - len(tokens["in"]))
 
     print(code_carbon_results)
 
@@ -210,10 +205,13 @@ if __name__ == "__main__":
     for key, val in results.items():
         mlflow.log_metric(key, val)
 
+    print("Log artifacts to disk...")
     emissions = os.path.expanduser("~/.let/emissions.csv")
     if os.path.isfile(emissions):
-        print("log artifact...")
         mlflow.log_artifact(emissions)
+    
+    artifacts = {"times": times, "tokens_in": tokens["in"], "tokens_out": tokens["out"]}
+    mlflow.log_dict(artifacts, "artifacts.json")
 
     mlflow.end_run()
     print(results)
