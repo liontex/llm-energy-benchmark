@@ -1,0 +1,50 @@
+{
+  "builder_name": "json",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "pure-dove",
+  "dataset_size": 11577071,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/LDJnr/Pure-Dove@d8f711ad5a96a42af44b13e1a5bb054e48ff3a69/Pure-Dove.jsonl": {
+      "num_bytes": 12066153,
+      "checksum": null
+    }
+  },
+  "download_size": 12066153,
+  "features": {
+    "input": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "simple": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "friendly": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "academic": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 23643224,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 11577071,
+      "num_examples": 3857,
+      "dataset_name": "pure-dove"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

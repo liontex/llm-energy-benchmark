@@ -1,9 +1,14 @@
 import argparse
 import os
+from time import sleep
+import json
+import http.client
 
 import ollama
 from datasets import load_dataset, load_from_disk
 
+open_ai_url = "chat.kiconnect.nrw"
+open_ai_auth_token = "Bearer <YOUR API AUTH TOKEN>"
 
 def build_cache_path(base_dir, dataset, split, seed, num_samples, model, temperature, simple, friendly, academic):
     simple = "s" if simple else ""
@@ -13,15 +18,44 @@ def build_cache_path(base_dir, dataset, split, seed, num_samples, model, tempera
     model_safe = model.replace("/", "_").replace(":", "_")
     return os.path.join(base_dir, f"{dataset_safe}_split{split}_n{num_samples}_seed{seed}_model{model_safe}_temperature{temperature}_flags{simple}{friendly}{academic}")
 
-
 def extract_input(row):
     row["input"] = row["conversation"][0]["input"]
     return row
 
-def chat(input, model, temperature, tone):
-    if tone == "simple":
-        tone_rule = "- The reformulation must use simple and easy to understand language."
+def ask_open_ai(model, prompt):
+    conn = http.client.HTTPSConnection(open_ai_url)
+    headers = {
+        'Content-Type': "application/json",
+        'Authorization': open_ai_auth_token
+    }
 
+    req = {"model": model, "input": prompt}
+
+    conn.request("POST", "/api/v1/responses", json.dumps(req), headers)
+
+    data = conn.getresponse().read().decode("utf-8")
+
+    data_json = json.loads(data)
+    response = None
+    try:
+        for output in data_json['output']:
+            if output['type'] == 'message' and output['status'] == 'completed':
+                for content in output['content']:
+                    response = content['text']
+    except Exception as exp:
+        print(f'error:{exp=}, response:{data_json=}')
+    return response
+
+def ask_ollama(model, prompt, temperature):
+    resp = ollama.chat(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": temperature}
+    )
+    return resp["message"].content
+
+def chat(args, input, model, temperature, tone):
+    if tone == "simple":
         message = f"""You are a teacher at an elementary school.
 
 You want to rewrite the provided input to give it to your students while preserving the exact meaning.
@@ -129,21 +163,26 @@ Input:
 {input}
 """
 
-    resp = ollama.chat(
-        model=model,
-        messages=[{"role": "user", "content": message}],
-        options={"temperature": temperature}
-    )
-    return resp["message"].content
+    if args.mode == "ollama":
+        response = ask_ollama(model, message, temperature)
+    elif args.mode == "open_ai":
+        response = ask_open_ai(model, message)
+    else:
+        raise ValueError("No valid mode was given, either 'ollama' or 'open_ai' mode.")
+
+    return response
 
 
-def reformulation(row, model, temperature, simple: bool, friendly: bool, academic: bool, verbose=False):
+def reformulation(args, row, model, temperature, simple: bool, friendly: bool, academic: bool, verbose=False):
     if simple:
-        row["simple"] = chat(row["input"], model, temperature, "simple")
+        row["simple"] = chat(args, row["input"], model, temperature, "simple")
     if friendly:
-        row["friendly"] = chat(row["input"], model, temperature, "friendly")
+        row["friendly"] = chat(args, row["input"], model, temperature, "friendly")
     if academic:
-        row["academic"] = chat(row["input"], model, temperature, "academic")
+        row["academic"] = chat(args, row["input"], model, temperature, "academic")
+
+    if args.mode == "open_ai":
+        sleep(5)
 
     if verbose:
         print("Original input:")
@@ -228,8 +267,9 @@ def main():
     parser.add_argument("-s", "--seed", type=int, help="Seed for shuffling the original dataset before reformulation")
     parser.add_argument("--hf_cache_dir", type=str, default="./hf_cache", help="Huggingface cache")
     parser.add_argument("--sample_cache_dir", type=str, default="./dataset_samples", help="Cache/Output directory")
+    parser.add_argument("--mode", default="ollama", help="Mode for dataset generation: Either locally via 'ollama' (default) or remote with 'open_ai' (credentials required)")
     parser.add_argument("--model", default="gemma3:27b", help="LLM used for the reformulation, loaded via ollama")
-    parser.add_argument("--temperature", type=float, default=0.5, help="temperature config for the LLM usage")
+    parser.add_argument("--temperature", type=float, default=0.5, help="temperature config for the LLM usage (local mode only)")
     parser.add_argument("-S", "--simple", action=argparse.BooleanOptionalAction, default=True, help="Generate simple formulation (default: true)")
     parser.add_argument("-F", "--friendly", action=argparse.BooleanOptionalAction, default=True, help="Generate friendly formulation (default: true)")
     parser.add_argument("-A", "--academic", action=argparse.BooleanOptionalAction, default=True, help="Generate academic formulation (default: true)")
@@ -263,7 +303,7 @@ def main():
 
         dataset = dataset.map(extract_input)
         dataset = dataset.select_columns("input")
-        
+
         print("Classify samples...")
         if args.classify:
             dataset = dataset.map(
@@ -272,7 +312,7 @@ def main():
 
         print("Generate reformulations...")
         dataset = dataset.map(
-            lambda row: reformulation(row, args.model, args.temperature, args.simple, args.friendly, args.academic, args.verbose)
+            lambda row: reformulation(args, row, args.model, args.temperature, args.simple, args.friendly, args.academic, args.verbose)
         )
 
         print(f"Save Sample-Cache: {sample_cache_path}")

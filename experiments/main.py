@@ -11,8 +11,6 @@ from lamarr_energy_tracker.tracker import delete_results
 from util import get_gpu_name, get_processor_name, print_colored_block, infos_from_dataset_path
 import ollama
 from llama_cpp import Llama
-from huggingface_hub import scan_cache_dir
-
 
 def read_queries(dataset_path, random=True, seed=None):
     conversations = pd.read_json(
@@ -30,7 +28,7 @@ def load_model(args):
             if len(ollama.list().models) > 1 or ollama.list().models[0].model != args.model:
                 for mod in ollama.list().models:
                     ollama.delete(mod.model)
-        
+
         ollama.pull(args.model)
         return ollama.Client(host='http://localhost:11434', timeout=args.timeout)
     elif args.backend == "llama.cpp":
@@ -209,7 +207,7 @@ if __name__ == "__main__":
     emissions = os.path.expanduser("~/.let/emissions.csv")
     if os.path.isfile(emissions):
         mlflow.log_artifact(emissions)
-    
+
     artifacts = {"times": times, "tokens_in": tokens["in"], "tokens_out": tokens["out"]}
     mlflow.log_dict(artifacts, "artifacts.json")
 

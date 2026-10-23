@@ -1,0 +1,3220 @@
+# Evaluation Pipeline for Experiments
+
+```elixir
+Mix.install([
+  {:explorer, "~> 0.11.1"},
+  {:kino, "~> 0.19.0"},
+  {:kino_explorer, "~> 0.1.25"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1.11"},
+  {:kino_db, "~> 0.4.0"},
+  {:exqlite, "~> 0.23.0"},
+  {:pythonx, "~> 0.4.2"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:statistics, "~> 0.6.3"},
+  {:vega_lite_convert, "~> 1.0"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.13.*"
+dependencies = ["scipy", "statsmodels"]
+```
+
+## Setup
+
+```elixir
+alias Explorer.{DataFrame, Series}
+require DataFrame
+```
+
+```python
+from scipy.stats import wilcoxon
+```
+
+```elixir
+base_path = "/Users/timm/Code/llm-energy-benchmark"
+```
+
+## ML Emissions Calculator
+
+```elixir
+rtx_4090 = "/Users/Timm/Code/llm-energy-benchmark/gpus.csv"
+|> DataFrame.from_csv!()
+|> DataFrame.filter(name == "RTX 4090")
+|> DataFrame.to_columns()
+```
+
+```elixir
+spark = %{
+  "name" => ["Nvidia GB 10"],
+  "source" => ["https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-v2.1.pdf"],
+  "tdp_watts" => [140],
+  "type" => ["gpu"]
+}
+```
+
+## DB Connections
+
+<!-- livebook:{"attrs":"eyJkYXRhYmFzZV9wYXRoIjoiL1VzZXJzL3RpbW0vQ29kZS9sbG0tZW5lcmd5LWJlbmNobWFyay9yZXN1bHRzL21sZmxvd19zcGFya18yLmRiIiwidHlwZSI6InNxbGl0ZSIsInZhcmlhYmxlIjoiY29ubl9zcGFyayJ9","chunks":null,"kind":"Elixir.KinoDB.ConnectionCell","livebook_object":"smart_cell"} -->
+
+```elixir
+opts = [database: "/Users/timm/Code/llm-energy-benchmark/results/mlflow_spark_2.db"]
+{:ok, conn_spark} = Kino.start_child({Exqlite, opts})
+```
+
+<!-- livebook:{"attrs":"eyJjYWNoZV9xdWVyeSI6dHJ1ZSwiY29ubmVjdGlvbiI6eyJ0eXBlIjoic3FsaXRlIiwidmFyaWFibGUiOiJjb25uX3NwYXJrIn0sInF1ZXJ5Ijoic2VsZWN0ICogXG5mcm9tIGV4cGVyaW1lbnRzIFxubGltaXQgMTAwIiwicmVzdWx0X3ZhcmlhYmxlIjoidyIsInRpbWVvdXQiOm51bGx9","chunks":null,"kind":"Elixir.KinoDB.SQLCell","livebook_object":"smart_cell"} -->
+
+```elixir
+w =
+  Exqlite.query!(
+    conn_spark,
+    ~S"""
+    select * 
+    from experiments 
+    limit 100
+    """,
+    []
+  )
+```
+
+<!-- livebook:{"attrs":"eyJkYXRhYmFzZV9wYXRoIjoiL1VzZXJzL3RpbW0vQ29kZS9sbG0tZW5lcmd5LWJlbmNobWFyay9yZXN1bHRzL21sZmxvd193cy5kYiIsInR5cGUiOiJzcWxpdGUiLCJ2YXJpYWJsZSI6ImNvbm5fd3MifQ","chunks":null,"kind":"Elixir.KinoDB.ConnectionCell","livebook_object":"smart_cell"} -->
+
+```elixir
+opts = [database: "/Users/timm/Code/llm-energy-benchmark/results/mlflow_ws.db"]
+{:ok, conn_ws} = Kino.start_child({Exqlite, opts})
+```
+
+<!-- livebook:{"attrs":"eyJjYWNoZV9xdWVyeSI6dHJ1ZSwiY29ubmVjdGlvbiI6eyJ0eXBlIjoic3FsaXRlIiwidmFyaWFibGUiOiJjb25uX3dzIn0sInF1ZXJ5Ijoic2VsZWN0ICogXG5mcm9tIGV4cGVyaW1lbnRzIFxubGltaXQgMTAwIiwicmVzdWx0X3ZhcmlhYmxlIjoid3MiLCJ0aW1lb3V0IjpudWxsfQ","chunks":null,"kind":"Elixir.KinoDB.SQLCell","livebook_object":"smart_cell"} -->
+
+```elixir
+ws =
+  Exqlite.query!(
+    conn_ws,
+    ~S"""
+    select * 
+    from experiments 
+    limit 100
+    """,
+    []
+  )
+```
+
+## Spark
+
+```elixir
+experiment_id_list = [39, 49, 50] #39 -> Gemma3:27b, 49 -> Mistral-small3.2:24b, 50 -> GPT5-Studierende
+|> Enum.join(", ")
+
+runs = conn_spark
+|> Exqlite.query!("select * from runs where experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+```
+
+```elixir
+metrics = conn_spark
+|> Exqlite.query!("select key, value, metrics.run_uuid from metrics left join runs on metrics.run_uuid = runs.run_uuid where runs.experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+|> DataFrame.pivot_wider("key", "value")
+```
+
+```elixir
+params = conn_spark
+|> Exqlite.query!("select key, value, params.run_uuid, runs.status, runs.artifact_uri, runs.experiment_id from params left join runs on params.run_uuid = runs.run_uuid where runs.experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+|> DataFrame.pivot_wider("key", "value")
+|> DataFrame.mutate(
+  seconds: cast(seconds, {:u, 16}),
+  temperature: round(cast(temperature, {:f, 32}), 1),
+  dataset_n_samples: cast(dataset_n_samples, {:u, 16}),
+  dataset_seed: cast(dataset_seed, {:u, 16}),
+  dataset_temperature: round(cast(dataset_temperature, {:f, 32}), 1),
+  file_size: cast(file_size, {:u, 32}),
+  n_samples: cast(n_samples, {:u, 16}),
+  parameters: cast(replace(parameters, "B", "e9"), {:f, 32}),
+  hardware: "DGX Spark"
+)
+|> DataFrame.mutate(
+  temperature: if(temperature > 0.69 and temperature <= 0.7, do: 0.7, else: temperature),
+  active_parameters: if(model == "gemma4:e4b", do: 4500000000, else: parameters)
+)
+```
+
+```elixir
+result = DataFrame.join(metrics, params)
+```
+
+```elixir
+result = 
+  result
+|> DataFrame.mutate(
+  static_energy_estimation: ^(Enum.at(spark["tdp_watts"], 0)) * running_time,
+  static_energy_estimation_total: ^(Enum.at(spark["tdp_watts"], 0)) * running_time_total,
+  token_out_per_second: n_tokens_out / (running_time_total - failed_time),
+  n_tokens_out_total: n_tokens_out + (n_tokens_out / (running_time_total - failed_time)) * failed_time
+)
+|> DataFrame.put("artifact_uri", Series.transform(result["artifact_uri"], fn row -> 
+  row
+  |> String.replace("/home/horny/llm-energy-benchmark/experiments/mlruns", 
+  "#{base_path}/results/mlflow_spark/mlruns")
+  end))
+```
+
+## Artifacts for Spark
+
+```elixir
+artifacts = result
+|> DataFrame.to_rows()
+  |> Enum.reduce([], fn row, acc -> 
+
+    value = "#{row["artifact_uri"]}/artifacts.json"
+|> File.read!()
+|> JSON.decode!()
+    
+    acc ++ [%{
+      "run_uuid" => row["run_uuid"], 
+      "times" => value["times"], 
+      "tokens_in" => value["tokens_in"], 
+      "tokens_out" => value["tokens_out"]}]
+  end)
+|> DataFrame.new()
+|> DataFrame.join(result)
+```
+
+```elixir
+comparisons = DataFrame.distinct(artifacts, ["model", "temperature"])
+|> DataFrame.to_rows()
+```
+
+```elixir
+comparisons = comparisons
+  |> Enum.map(fn %{"model" => model, "temperature" => temperature} = map -> 
+    current = artifacts
+    |> DataFrame.filter(model == ^model and temperature == ^temperature)
+
+    Map.put(map, "data", current)
+  end)
+```
+
+## Single Experiment Evaluation for Spark
+
+```elixir
+Enum.at(comparisons, 0)
+```
+
+```elixir
+single_experiment = comparisons
+  |> Enum.at(0)
+  |> Map.get("data")
+  |> DataFrame.filter(dataset_model == "gemma3_27b")
+|> DataFrame.to_rows()
+|> Enum.map(fn %{"run_uuid" => run_uuid, "tokens_out" => tokens_out, "times" => times, "field" => field, "running_time_total" => running_time_total} ->
+  tokens_out
+  |> Enum.zip(times)
+  |> Enum.with_index()
+  |> Enum.map(fn {{token_out, time}, index} ->
+    %{"run_uuid" => run_uuid, 
+      "token_out" => token_out, 
+      "time" => time, 
+      "index" => index + 1, 
+      "field" => field,
+      "running_time_total" => running_time_total
+    }
+  end)
+  end)
+|> List.flatten()
+|> DataFrame.new()
+|> DataFrame.mutate(field: if(field == "input", do: "original", else: field))
+```
+
+```elixir
+original = DataFrame.filter(single_experiment, field == "original" and time < 900 and token_out < 4000)
+|> DataFrame.mutate(token_input: token_out, time_input: time, order: 4)
+simple = DataFrame.filter(single_experiment, field == "simple" and time < 900 and token_out < 4000)
+|> DataFrame.mutate(token_simple: token_out, time_simple: time, order: 1)
+friendly = DataFrame.filter(single_experiment, field == "friendly" and time < 900 and token_out < 4000)
+|> DataFrame.mutate(token_friendly: token_out, time_friendly: time, order: 2)
+academic = DataFrame.filter(single_experiment, field == "academic" and time < 900 and token_out < 4000)
+|> DataFrame.mutate(token_academic: token_out, time_academic: time, order: 3)
+
+d = [simple: simple, friendly: friendly, academic: academic, original: original]
+```
+
+```elixir
+%{"model" => model, "temperature" => temperature} = Enum.at(comparisons, 0)
+
+vl = VegaLite.new(title: "Model: #{String.capitalize(model)}, temperature: #{temperature}, dataset LLM: Gemma3:27b", width: 600)
+|> VegaLite.concat(Enum.map(d, fn {field, x} ->
+  VegaLite.new(width: 600)
+  |> VegaLite.mark(:rule)
+  |> VegaLite.data_from_values(x, only: ["token_out", "field", "order"])
+  |> VegaLite.encode_field(:x, "token_out", type: :quantitative, bin: [maxbins: 200], scale: [domain: [0, 3120]], title: (if field == :original, do: "Amount of generated token (binned with 200 bins)", else: nil))
+  |> VegaLite.encode(:y, aggregate: :count, scale: [domain: [0, 50]], title: "Number of prompts")
+  |> VegaLite.encode_field(:color, "field", type: :nominal, sort: "order", title: "Language style")
+  end), :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/token-binned.pdf")
+
+vl
+```
+
+```elixir
+dd = DataFrame.select(original, [:index, :token_input, :time_input])
+|> DataFrame.join(DataFrame.select(simple, [:index, :token_simple, :time_simple]), on: [index: :index])
+|> DataFrame.join(DataFrame.select(friendly, [:index, :token_friendly, :time_friendly]), on: [index: :index])
+|> DataFrame.join(DataFrame.select(academic, [:index, :token_academic, :time_academic]), on: [index: :index])
+|> DataFrame.mutate(
+  diff_simple: token_input - token_simple,
+  diff_friendly: token_input - token_friendly,
+  diff_academic: token_input - token_academic,
+  diff_time_simple: time_input - time_simple,
+  diff_time_friendly: time_input - time_friendly,
+  diff_time_academic: time_input - time_academic,
+  diff_simple_academic: token_simple - token_academic,
+  field_simple: "simple",
+  field_friendly: "friendly",
+  field_academic: "academic",
+  order_simple: 1,
+  order_friendly: 2,
+  order_academic: 3
+)
+```
+
+```elixir
+names = %{
+  "simple" => "Differences original - simple",
+  "friendly" => "Differences original - friendly",
+  "academic" => "Differences original - academic"
+}
+%{"model" => model, "temperature" => temperature} = Enum.at(comparisons, 0)
+medians = Enum.map(Map.keys(names), fn name ->
+  {name, [Series.median(dd["diff_#{name}"])]}
+  end)
+|> Map.new()
+
+vl = VegaLite.new(title: "Model: #{String.capitalize(model)}, temperature: #{temperature}, dataset LLM: Gemma3:27b", width: 600)
+|> VegaLite.concat(
+  ["simple", "friendly", "academic"]
+  |> Enum.map(fn field ->
+  VegaLite.new(title: Map.get(names, field), width: 600)
+  |> VegaLite.layers(
+    [
+      VegaLite.new()
+      |> VegaLite.mark(:bar)
+      |> VegaLite.data_from_values(dd)
+      |> VegaLite.encode_field(:x, "diff_#{field}", type: :quantitative, bin: [maxbins: 200], scale: [domain: [-1600, 1600]], title: "Differences of amounts of generated token (200 bins), Median of Differences (black)")
+      |> VegaLite.encode(:y, aggregate: :count, scale: [domain: [0, 100]])
+      |> VegaLite.encode_field(:color, "field_#{field}", sort: "order_#{field}", type: :nominal, title: nil, legend: nil),
+      VegaLite.new()
+      |> VegaLite.mark(:rule, color: :black, size: 3)
+      |> VegaLite.data_from_values(medians)
+      |> VegaLite.encode_field(:x, field, type: :quantitative, scale: [domain: [-1600, 1600]])
+    ]
+  )
+  end), :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/differences-formulations.pdf")
+
+vl
+```
+
+```elixir
+Enum.map(d, fn {field, x} ->
+%{
+    field: to_string(field),
+    mean: x["token_out"] |> Series.mean(),
+    median: x["token_out"] |> Series.median(),
+    standard_deviation: x["token_out"] |> Series.standard_deviation(),
+    variance: x["token_out"] |> Series.variance()
+  }
+end)
+|> DataFrame.new()
+```
+
+```elixir
+Enum.map(d, fn {field, x} ->
+%{
+    field: to_string(field),
+    mean: x["time"] |> Series.mean(),
+    median: x["time"] |> Series.median(),
+    standard_deviation: x["time"] |> Series.standard_deviation(),
+    variance: x["time"] |> Series.variance()
+  }
+end)
+|> DataFrame.new()
+```
+
+## Wilcoxon for Spark
+
+```elixir
+comparisons = comparisons
+  |> Enum.map(fn %{"model" => model, "temperature" => temperature, "data" => data} ->
+
+    input = (DataFrame.filter(data, field == "input"))["tokens_out"][0]
+    simple = (DataFrame.filter(data, field == "simple"))["tokens_out"][0]
+    friendly = (DataFrame.filter(data, field == "friendly"))["tokens_out"][0]
+    academic = (DataFrame.filter(data, field == "academic"))["tokens_out"][0]
+
+    input_median = input
+    |> Series.from_list()
+    |> Series.median()
+
+    simple_median = simple
+    |> Series.from_list()
+    |> Series.median()
+
+    friendly_median = friendly
+    |> Series.from_list()
+    |> Series.median()
+
+    academic_median = academic
+    |> Series.from_list()
+    |> Series.median()
+
+    time_input = (DataFrame.filter(data, field == "input"))["times"][0]
+    time_simple = (DataFrame.filter(data, field == "simple"))["times"][0]
+    time_friendly = (DataFrame.filter(data, field == "friendly"))["times"][0]
+    time_academic = (DataFrame.filter(data, field == "academic"))["times"][0]
+
+    time_input_median = time_input
+    |> Series.from_list()
+    |> Series.median()
+
+    time_simple_median = time_simple
+    |> Series.from_list()
+    |> Series.median()
+
+    time_friendly_median = time_friendly
+    |> Series.from_list()
+    |> Series.median()
+
+    time_academic_median = time_academic
+    |> Series.from_list()
+    |> Series.median()
+    
+%{
+  model: model,
+  temperature: temperature,
+  input: input,
+  simple: simple,
+  friendly: friendly,
+  academic: academic,
+  input_median: input_median,
+  simple_median: simple_median,
+  friendly_median: friendly_median,
+  academic_median: academic_median,
+  time_input: time_input,
+  time_simple: time_simple,
+  time_friendly: time_friendly,
+  time_academic: time_academic,
+  time_input_median: time_input_median,
+  time_simple_median: time_simple_median,
+  time_friendly_median: time_friendly_median,
+  time_academic_median: time_academic_median
+}
+    end)
+```
+
+```python
+wilcoxon_results = []
+for comparison in comparisons:
+  if len(comparison["input"]) == len(comparison["simple"]):
+    simple = wilcoxon(comparison["input"], comparison["simple"], zero_method="pratt")
+    simple_time = wilcoxon(comparison["time_input"], comparison["time_simple"], zero_method="pratt")
+  else:
+    simple = wilcoxon(comparison["input"][:len(comparison["simple"])], comparison["simple"], zero_method="pratt")
+    simple_time = wilcoxon(comparison["time_input"][:len(comparison["time_simple"])], comparison["time_simple"], zero_method="pratt")
+
+  if len(comparison["input"]) == len(comparison["friendly"]):
+    friendly = wilcoxon(comparison["input"], comparison["friendly"], zero_method="pratt")
+    friendly_time = wilcoxon(comparison["time_input"], comparison["time_friendly"], zero_method="pratt")
+  else:
+    friendly = wilcoxon(comparison["input"][:len(comparison["friendly"])], comparison["friendly"], zero_method="pratt")
+    friendly_time = wilcoxon(comparison["time_input"][:len(comparison["time_friendly"])], comparison["time_friendly"], zero_method="pratt")
+
+  if len(comparison["input"]) == len(comparison["academic"]):
+    academic = wilcoxon(comparison["input"], comparison["academic"], zero_method="pratt")
+    academic_time = wilcoxon(comparison["time_input"], comparison["time_academic"], zero_method="pratt")
+  else:
+    academic = wilcoxon(comparison["input"][:len(comparison["academic"])], comparison["academic"], zero_method="pratt")
+    academic_time = wilcoxon(comparison["time_input"][:len(comparison["time_academic"])], comparison["time_academic"], zero_method="pratt")
+
+  wilcoxon_results.append({"model": comparison["model"],
+                          "temperature": comparison["temperature"],
+                           "simple": simple,
+                           "friendly": friendly,
+                           "academic": academic,
+                           "input_median": comparison["input_median"],
+                           "simple_median": comparison["simple_median"],
+                           "friendly_median": comparison["friendly_median"],
+                           "academic_median": comparison["academic_median"],
+                           "simple_time": simple_time,
+                           "friendly_time": friendly_time,
+                           "academic_time": academic_time,
+                           "time_input_median": comparison["time_input_median"],
+                           "time_simple_median": comparison["time_simple_median"],
+                           "time_friendly_median": comparison["time_friendly_median"],
+                           "time_academic_median": comparison["time_academic_median"]
+                          })
+```
+
+```elixir
+wilcoxon_results = wilcoxon_results
+|> Pythonx.decode()
+|> Enum.map(fn %{
+  "simple" => {_, simple}, 
+  "friendly" => {_, friendly}, 
+  "academic" => {_, academic}, 
+  "simple_time" => {_, simple_time}, 
+  "friendly_time" => {_, friendly_time}, 
+  "academic_time" => {_, academic_time}, 
+  "model" => model, 
+  "temperature" => temperature,
+  "input_median" => input_median,
+  "simple_median" => simple_median,
+  "friendly_median" => friendly_median,
+  "academic_median" => academic_median,
+  "time_input_median" => time_input_median,
+  "time_simple_median" => time_simple_median,
+  "time_friendly_median" => time_friendly_median,
+  "time_academic_median" => time_academic_median
+} ->
+
+  [
+    %{"field" => "input", "median_time" => time_input_median, "median_token_out" => input_median, "diff_median_token_out" => 0, "diff_median_time" => 0, "wilcoxon_token_out" => 1, "wilcoxon_time" => 1, "model" => model, "temperature" => temperature},
+    %{"field" => "simple", "median_time" => time_simple_median, "median_token_out" => simple_median, "diff_median_token_out" => -1 * (input_median - simple_median), "diff_median_time" => -1 * (time_input_median - time_simple_median), "wilcoxon_token_out" => simple, "wilcoxon_time" => simple_time, "model" => model, "temperature" => temperature},
+    %{"field" => "friendly", "median_time" => time_friendly_median, "median_token_out" => friendly_median, "diff_median_token_out" => -1 * (input_median - friendly_median), "diff_median_time" => -1 * (time_input_median - time_friendly_median), "wilcoxon_token_out" => friendly, "wilcoxon_time" => friendly_time, "model" => model, "temperature" => temperature},
+    %{"field" => "academic", "median_time" => time_academic_median, "median_token_out" => academic_median, "diff_median_token_out" => -1 * (input_median - academic_median), "diff_median_time" => -1 * (time_input_median - time_academic_median), "wilcoxon_token_out" => academic, "wilcoxon_time" => academic_time, "model" => model, "temperature" => temperature},
+  ]
+end)
+|> List.flatten()
+|> DataFrame.new()
+|> DataFrame.mutate(
+  relative_median_difference: diff_median_token_out / (median_token_out - diff_median_token_out),
+  relative_median_difference_time: diff_median_time / (median_time - diff_median_time)
+)
+```
+
+```elixir
+result = result
+|> DataFrame.join(wilcoxon_results)
+```
+
+```elixir
+result_without_input = result
+|> DataFrame.filter(field != "input")
+  |> DataFrame.mutate(alternative_hypothesis: 1 - wilcoxon_token_out, alternative_hypothesis_time: 1 - wilcoxon_time,
+    relative_median_difference: relative_median_difference * 100, 
+    relative_median_difference_time: relative_median_difference_time * 100,
+    significance: 
+      if wilcoxon_token_out > 0.05 do 
+        "" 
+      else 
+        if wilcoxon_token_out > 0.01 do
+          "*"
+        else
+          if wilcoxon_token_out > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end,
+    significance_time: 
+      if wilcoxon_time > 0.05 do 
+        "" 
+      else 
+        if wilcoxon_time > 0.01 do
+          "*"
+        else
+          if wilcoxon_time > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end
+  )
+  |> DataFrame.transform(fn r ->
+    [key: "#{r["model"]} (t = #{r["temperature"]})"]
+  end)
+|> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+vl = VegaLite.new(title: "DGX Spark")
+|> VegaLite.concat(
+  [
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_without_input,
+  only: ["key", "field", "diff_median_token_out", "active_parameters", "significance"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, axis: nil, sort: [field: "active_parameters"])
+|> VegaLite.encode_field(:y, "diff_median_token_out", 
+  aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-90, 90]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], 
+    title: "Absolute Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_token_out >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_token_out < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+]),
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_without_input,
+  only: ["key", "field", "relative_median_difference", "active_parameters", "significance"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, sort: [field: "active_parameters"], title: "Model and Temperature")
+|> VegaLite.encode_field(:y, "relative_median_difference", aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-15, 20]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], label_expr: "datum.label + '%'"],
+  title: "Relative Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal) 
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+])
+  ], :vertical
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/wilcoxon-spark.pdf")
+
+vl
+```
+
+```elixir
+impacts = result_without_input
+|> DataFrame.filter(alternative_hypothesis >= 0.95 and model not in ["gemma4:12b", "llama3.2:3b", "mistral-small3.2:24b"])
+|> DataFrame.group_by(["key", "field"])
+|> DataFrame.summarise(alternative_hypothesis: median(alternative_hypothesis), diff_median_token_out: median(diff_median_token_out),
+  scaled_diff: median(alternative_hypothesis) * median(diff_median_token_out),
+  scaled_diff_abs: median(alternative_hypothesis) * median(abs(diff_median_token_out)),
+  active_parameters: first(active_parameters)
+)
+|> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+vl = VegaLite.new(title: "DGX Spark")
+|> VegaLite.concat(
+  [
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_without_input,
+  only: ["key", "field", "diff_median_time", "active_parameters", "significance_time"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, axis: nil, sort: [field: "active_parameters"])
+|> VegaLite.encode_field(:y, "diff_median_time", 
+  aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-8,8]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], 
+    title: "Absolute Difference Median in s")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_time >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_time < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal)
+]),
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_without_input,
+  only: ["key", "field", "relative_median_difference_time", "active_parameters", "significance_time"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, sort: [field: "active_parameters"], title: "Model and Temperature")
+|> VegaLite.encode_field(:y, "relative_median_difference_time", aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-15, 20]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], label_expr: "datum.label + '%'"],
+  title: "Relative Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal) 
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference_time >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference_time < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal)
+])
+  ], :vertical
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/wilcoxon-time-spark.pdf")
+
+vl
+```
+
+```elixir
+result_without_input = result_without_input
+|> DataFrame.mutate(
+  static_energy_estimation_per_token: static_energy_estimation_total / n_tokens_out_total,
+  dynamic_energy_estimation_per_token: power_draw_total / n_tokens_out_total,
+  ground_truth_energy_per_token: ground_truth_power_draw_total / n_tokens_out_total
+)
+|> DataFrame.mutate(
+  diff_median_static_estimation: static_energy_estimation_per_token * diff_median_token_out,
+  diff_median_dynamic_estimation: dynamic_energy_estimation_per_token * diff_median_token_out,
+  diff_median_ground_truth: ground_truth_energy_per_token * diff_median_token_out
+)
+```
+
+```elixir
+a = result_without_input
+|> DataFrame.group_by("field")
+|> DataFrame.summarise(relative_median_difference: relative_median_difference, parameters: parameters, active_parameters: active_parameters, field_list: field, temperature: first(temperature), hardware: first(hardware))
+|> DataFrame.to_rows()
+```
+
+```elixir
+colors = %{"simple" => "#eb7f83", "friendly" => "#ffc57e", "academic" => "#97abff"}
+drop = ["field", "temperature", "hardware"]
+
+VegaLite.new(title: "Count of parameters vs. Quotient of Median Differences (#{result_without_input["hardware"][0]})", width: 400)
+|> VegaLite.layers(
+      Enum.map(a, fn %{"field" => field} = x ->
+        color = Map.get(colors, field)
+
+        VegaLite.new(title: "temperature = #{x["temperature"]}")
+        |> VegaLite.data_from_values(Map.drop(x, drop))
+        |> VegaLite.layers([
+          VegaLite.new()
+          |> VegaLite.mark(:point, color: color)
+          |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative)
+          |> VegaLite.encode_field(:y, "relative_median_difference", type: :quantitative, scale: [domain: [-6, 18]], axis: %{"labelExpr" => "datum.label + '%'"}, title: "Quotient median difference")
+          |> VegaLite.encode_field(:color, "field_list", type: :nominal, title: "language style"),
+          VegaLite.new()
+          |> VegaLite.mark(:line, color: color)
+          |> VegaLite.transform(regression: "relative_median_difference", on: "active_parameters")
+          |> VegaLite.transform(values: "field_list")
+          |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative, title: "Count of active parameters")
+          |> VegaLite.encode_field(:y, "relative_median_difference", type: :quantitative)
+        ])
+        end)
+      
+    
+)
+```
+
+```elixir
+y = result
+|> DataFrame.select(["wilcoxon_token_out", "field"])
+|> DataFrame.mutate(alternative_hypothesis_prob: 1 - wilcoxon_token_out)
+```
+
+```elixir
+y = ["input", "simple", "friendly", "academic"]
+|> Enum.map(fn field ->
+  list = DataFrame.filter(y, field == ^field)["alternative_hypothesis_prob"]
+  |> Series.to_list()
+
+  {field, list}
+end)
+|> Map.new()
+```
+
+## Spark Evaluation
+
+```elixir
+VegaLite.new(width: 400)
+|> VegaLite.data_from_values(result, 
+  only: ["power_draw_total", "ground_truth_power_draw_total", "static_energy_estimation_total", "field"])
+|> VegaLite.layers([
+  #VegaLite.new()
+  #|> VegaLite.mark(:rule)
+  #|> VegaLite.encode_field(:x, "ground_truth_power_draw_total", type: :quantitative)
+  #|> VegaLite.encode_field(:x2, "power_draw_total", type: :quantitative)
+  #|> VegaLite.encode_field(:y, "field", type: :nominal)
+  #|> VegaLite.encode_field(:color, "field", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:point, shape: :stroke, angle: 90, opacity: 1, color: :green)
+  |> VegaLite.encode_field(:x, "ground_truth_power_draw_total", type: :quantitative)
+  |> VegaLite.encode_field(:y, "field", type: :nominal),
+  #|> VegaLite.encode_field(:color, "field", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:point, shape: :stroke, angle: 90, opacity: 1, color: :blue)
+  |> VegaLite.encode_field(:x, "power_draw_total", type: :quantitative)
+  |> VegaLite.encode_field(:y, "field", type: :nominal),
+  #|> VegaLite.encode_field(:color, "field", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:point, shape: :stroke, angle: 90, opacity: 1, color: :red)
+  |> VegaLite.encode_field(:x, "static_energy_estimation_total", type: :quantitative)
+  |> VegaLite.encode_field(:y, "field", type: :nominal)
+  #|> VegaLite.encode_field(:color, "field", type: :nominal)
+])
+```
+
+```elixir
+r1 = result
+|> DataFrame.mutate(
+  energy: ground_truth_power_draw, 
+  energy_total: ground_truth_power_draw_total,
+  method: "ground_truth")
+
+r2 = result
+|> DataFrame.mutate(
+  energy: power_draw, 
+  energy_total: power_draw_total,
+  method: "codecarbon")
+
+r3 = result
+|> DataFrame.mutate(
+  energy: running_time * ^(Enum.at(spark["tdp_watts"], 0)), 
+  energy_total: running_time_total * ^(Enum.at(spark["tdp_watts"], 0)), 
+  method: "ml_emission_calculator")
+
+r = DataFrame.concat_rows([r1, r2, r3])
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6InBvaW50IiwiY29sb3JfZmllbGQiOm51bGwsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOm51bGwsImRhdGFfdmFyaWFibGUiOiJyIiwiZ2VvZGF0YV9jb2xvciI6ImJsdWUiLCJsYXRpdHVkZV9maWVsZCI6bnVsbCwibG9uZ2l0dWRlX2ZpZWxkIjpudWxsLCJ4X2ZpZWxkIjoiZW5lcmd5IiwieF9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOiJsb2ciLCJ4X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUiLCJ5X2ZpZWxkIjoibW9kZWwiLCJ5X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieV9maWVsZF9iaW4iOm51bGwsInlfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieV9maWVsZF90eXBlIjoibm9taW5hbCJ9XSwidmxfYWxpYXMiOiJFbGl4aXIuVmVnYUxpdGUiLCJ3aWR0aCI6bnVsbH0","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(r, only: ["energy", "model"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log])
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+```
+
+```elixir
+VegaLite.new(width: 500, height: 300)
+|> VegaLite.data_from_values(r, only: ["energy", "model", "method", "field", "temperature"])
+|> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log])
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:y_offset, "temperature", type: :nominal)
+|> VegaLite.encode_field(:color, "method", type: :nominal)
+```
+
+```elixir
+VegaLite.new(width: 500, height: 300)
+|> VegaLite.data_from_values(r,
+  only: ["model", "temperature", "energy", "method", "field"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log])
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:y_offset, "field", type: :nominal)
+|> VegaLite.encode_field(:color, "field", type: :nominal)
+|> VegaLite.encode_field(:opacity, "temperature", type: :nominal)
+|> VegaLite.encode_field(:shape, "method", type: :nominal)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6InBvaW50IiwiY29sb3JfZmllbGQiOiJmaWVsZCIsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOiJub21pbmFsIiwiZGF0YV92YXJpYWJsZSI6InJlc3VsdCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6ImZpZWxkIiwieF9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInhfZmllbGRfdHlwZSI6Im5vbWluYWwiLCJ5X2ZpZWxkIjoicG93ZXJfZHJhd190b3RhbCIsInlfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ5X2ZpZWxkX2JpbiI6bnVsbCwieV9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ5X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUifV0sInZsX2FsaWFzIjoiRWxpeGlyLlZlZ2FMaXRlIiwid2lkdGgiOm51bGx9","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(result, only: ["field", "power_draw_total"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "field", type: :nominal)
+|> VegaLite.encode_field(:y, "power_draw_total", type: :quantitative)
+|> VegaLite.encode_field(:color, "field", type: :nominal)
+```
+
+## WS
+
+```elixir
+experiment_id_list = [8, 12, 13, 14] # 8 -> Gemma3, 12 -> Mistral, 13&14 -> GPT5-Studi
+|> Enum.join(", ")
+```
+
+```elixir
+runs_ws = conn_ws
+|> Exqlite.query!("select * from runs where experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+```
+
+```elixir
+metrics_ws = conn_ws
+|> Exqlite.query!("select key, value, metrics.run_uuid from metrics left join runs on metrics.run_uuid = runs.run_uuid where runs.experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+|> DataFrame.pivot_wider("key", "value")
+```
+
+```elixir
+params_ws = conn_ws
+|> Exqlite.query!("select key, value, params.run_uuid, runs.status, runs.artifact_uri, runs.experiment_id from params left join runs on params.run_uuid = runs.run_uuid where runs.experiment_id in (#{experiment_id_list})")
+|> DataFrame.new()
+|> DataFrame.pivot_wider("key", "value")
+|> DataFrame.mutate(
+  seconds: cast(seconds, {:u, 16}),
+  temperature: round(cast(temperature, {:f, 32}), 1),
+  dataset_n_samples: cast(dataset_n_samples, {:u, 16}),
+  dataset_seed: cast(dataset_seed, {:u, 16}),
+  dataset_temperature: round(cast(dataset_temperature, {:f, 32}), 1),
+  file_size: cast(file_size, {:u, 32}),
+  n_samples: cast(n_samples, {:u, 16}),
+  parameters: cast(replace(parameters, "B", "e9"), {:f, 32}),
+  hardware: "Workstation"
+)
+|> DataFrame.mutate(
+  temperature: if(temperature > 0.69 and temperature <= 0.7, do: 0.7, else: temperature),
+  active_parameters: if(model == "gemma4:e4b", do: 4500000000, else: 
+    if(model == "llama4:scout", do: 17000000000, else: parameters))
+)
+```
+
+```elixir
+result_ws = DataFrame.join(params_ws, metrics_ws)
+|> DataFrame.filter(model != "magistral:24b")
+```
+
+```elixir
+result_ws = 
+  result_ws
+|> DataFrame.mutate(
+  static_energy_estimation: ^(Enum.at(rtx_4090["tdp_watts"], 0)) * running_time,
+  static_energy_estimation_total: ^(Enum.at(rtx_4090["tdp_watts"], 0)) * running_time_total,
+  token_out_per_second: n_tokens_out / (running_time_total - failed_time),
+  n_tokens_out_total: n_tokens_out + (n_tokens_out / (running_time_total - failed_time)) * failed_time
+)
+|> DataFrame.put("artifact_uri", Series.transform(result_ws["artifact_uri"], fn row -> 
+  row
+  |> String.replace("/home/horny/llm-energy-benchmark/experiments/mlruns", 
+  "#{base_path}/results/mlflow_ws/mlruns")
+  end))
+```
+
+## Artifacts for Workstation
+
+```elixir
+artifacts_ws = result_ws
+|> DataFrame.to_rows()
+  |> Enum.reduce([], fn row, acc -> 
+
+    value = "#{row["artifact_uri"]}/artifacts.json"
+|> File.read!()
+|> JSON.decode!()
+    
+    acc ++ [%{
+      "run_uuid" => row["run_uuid"], 
+      "times" => value["times"], 
+      "tokens_in" => value["tokens_in"], 
+      "tokens_out" => value["tokens_out"]}]
+  end)
+|> DataFrame.new()
+|> DataFrame.join(result_ws)
+```
+
+```elixir
+comparisons_ws = DataFrame.distinct(artifacts_ws, ["model", "temperature"])
+|> DataFrame.to_rows()
+```
+
+```elixir
+comparisons_ws = comparisons_ws
+  |> Enum.map(fn %{"model" => model, "temperature" => temperature} = map -> 
+    current = artifacts_ws
+    |> DataFrame.filter(model == ^model and temperature == ^temperature)
+
+    Map.put(map, "data", current)
+  end)
+  |> Enum.reject(fn %{"model" => model} -> model == "magistral:24b" end)
+```
+
+## Wilcoxon for Workstation
+
+```elixir
+comparisons_ws = comparisons_ws
+  |> Enum.map(fn %{"model" => model, "temperature" => temperature, "data" => data} ->
+
+    input = (DataFrame.filter(data, field == "input"))["tokens_out"][0]
+    simple = (DataFrame.filter(data, field == "simple"))["tokens_out"][0]
+    friendly = (DataFrame.filter(data, field == "friendly"))["tokens_out"][0]
+    academic = (DataFrame.filter(data, field == "academic"))["tokens_out"][0]
+
+    input_median = input
+    |> Series.from_list()
+    |> Series.median()
+
+    simple_median = simple
+    |> Series.from_list()
+    |> Series.median()
+
+    friendly_median = friendly
+    |> Series.from_list()
+    |> Series.median()
+
+    academic_median = academic
+    |> Series.from_list()
+    |> Series.median()
+
+    time_input = (DataFrame.filter(data, field == "input"))["times"][0]
+    time_simple = (DataFrame.filter(data, field == "simple"))["times"][0]
+    time_friendly = (DataFrame.filter(data, field == "friendly"))["times"][0]
+    time_academic = (DataFrame.filter(data, field == "academic"))["times"][0]
+
+    time_input_median = time_input
+    |> Series.from_list()
+    |> Series.median()
+
+    time_simple_median = time_simple
+    |> Series.from_list()
+    |> Series.median()
+
+    time_friendly_median = time_friendly
+    |> Series.from_list()
+    |> Series.median()
+
+    time_academic_median = time_academic
+    |> Series.from_list()
+    |> Series.median()
+    
+%{
+  model: model,
+  temperature: temperature,
+  input: input,
+  simple: simple,
+  friendly: friendly,
+  academic: academic,
+  input_median: input_median,
+  simple_median: simple_median,
+  friendly_median: friendly_median,
+  academic_median: academic_median,
+  time_input: time_input,
+  time_simple: time_simple,
+  time_friendly: time_friendly,
+  time_academic: time_academic,
+  time_input_median: time_input_median,
+  time_simple_median: time_simple_median,
+  time_friendly_median: time_friendly_median,
+  time_academic_median: time_academic_median
+}
+    end)
+```
+
+```python
+wilcoxon_results_ws = []
+for comparison in comparisons_ws:
+  if len(comparison["input"]) == len(comparison["simple"]):
+    simple = wilcoxon(comparison["input"], comparison["simple"], zero_method="pratt")
+    simple_time = wilcoxon(comparison["time_input"], comparison["time_simple"], zero_method="pratt")
+  else:
+    simple = wilcoxon(comparison["input"][:len(comparison["simple"])], comparison["simple"], zero_method="pratt")
+    simple_time = wilcoxon(comparison["time_input"][:len(comparison["time_simple"])], comparison["time_simple"], zero_method="pratt")
+
+  if len(comparison["input"]) == len(comparison["friendly"]):
+    friendly = wilcoxon(comparison["input"], comparison["friendly"], zero_method="pratt")
+    friendly_time = wilcoxon(comparison["time_input"], comparison["time_friendly"], zero_method="pratt")
+  else:
+    friendly = wilcoxon(comparison["input"][:len(comparison["friendly"])], comparison["friendly"], zero_method="pratt")
+    friendly_time = wilcoxon(comparison["time_input"][:len(comparison["time_friendly"])], comparison["time_friendly"], zero_method="pratt")
+
+  if len(comparison["input"]) == len(comparison["academic"]):
+    academic = wilcoxon(comparison["input"], comparison["academic"], zero_method="pratt")
+    academic_time = wilcoxon(comparison["time_input"], comparison["time_academic"], zero_method="pratt")
+  else:
+    academic = wilcoxon(comparison["input"][:len(comparison["academic"])], comparison["academic"], zero_method="pratt")
+    academic_time = wilcoxon(comparison["time_input"][:len(comparison["time_academic"])], comparison["time_academic"], zero_method="pratt")
+
+  wilcoxon_results_ws.append({"model": comparison["model"],
+                          "temperature": comparison["temperature"],
+                           "simple": simple,
+                           "friendly": friendly,
+                           "academic": academic,
+                           "input_median": comparison["input_median"],
+                           "simple_median": comparison["simple_median"],
+                           "friendly_median": comparison["friendly_median"],
+                           "academic_median": comparison["academic_median"],
+                           "simple_time": simple_time,
+                           "friendly_time": friendly_time,
+                           "academic_time": academic_time,
+                           "time_input_median": comparison["time_input_median"],
+                           "time_simple_median": comparison["time_simple_median"],
+                           "time_friendly_median": comparison["time_friendly_median"],
+                           "time_academic_median": comparison["time_academic_median"]
+                          })
+```
+
+```elixir
+wilcoxon_results_ws = wilcoxon_results_ws
+|> Pythonx.decode()
+|> Enum.map(fn %{
+  "simple" => {_, simple}, 
+  "friendly" => {_, friendly}, 
+  "academic" => {_, academic}, 
+  "simple_time" => {_, simple_time}, 
+  "friendly_time" => {_, friendly_time}, 
+  "academic_time" => {_, academic_time}, 
+  "model" => model, 
+  "temperature" => temperature,
+  "input_median" => input_median,
+  "simple_median" => simple_median,
+  "friendly_median" => friendly_median,
+  "academic_median" => academic_median,
+  "time_input_median" => time_input_median,
+  "time_simple_median" => time_simple_median,
+  "time_friendly_median" => time_friendly_median,
+  "time_academic_median" => time_academic_median
+} ->
+
+  [
+    %{"field" => "input", "median_time" => time_input_median, "median_token_out" => input_median, "diff_median_token_out" => 0, "diff_median_time" => 0, "wilcoxon_token_out" => 1, "wilcoxon_time" => 1, "model" => model, "temperature" => temperature},
+    %{"field" => "simple", "median_time" => time_simple_median, "median_token_out" => simple_median, "diff_median_token_out" => -1 * (input_median - simple_median), "diff_median_time" => -1 * (time_input_median - time_simple_median), "wilcoxon_token_out" => simple, "wilcoxon_time" => simple_time, "model" => model, "temperature" => temperature},
+    %{"field" => "friendly", "median_time" => time_friendly_median, "median_token_out" => friendly_median, "diff_median_token_out" => -1 * (input_median - friendly_median), "diff_median_time" => -1 * (time_input_median - time_friendly_median), "wilcoxon_token_out" => friendly, "wilcoxon_time" => friendly_time, "model" => model, "temperature" => temperature},
+    %{"field" => "academic", "median_time" => time_academic_median, "median_token_out" => academic_median, "diff_median_token_out" => -1 * (input_median - academic_median), "diff_median_time" => -1 * (time_input_median - time_academic_median), "wilcoxon_token_out" => academic, "wilcoxon_time" => academic_time, "model" => model, "temperature" => temperature},
+  ]
+end)
+|> List.flatten()
+|> DataFrame.new()
+|> DataFrame.mutate(
+  relative_median_difference: diff_median_token_out / (median_token_out - diff_median_token_out),
+  relative_median_difference_time: diff_median_time / (median_time - diff_median_time)
+)
+```
+
+```elixir
+result_ws = DataFrame.join(result_ws, wilcoxon_results_ws)
+```
+
+```elixir
+result_ws_without_input = result_ws
+|> DataFrame.filter(field != "input")
+  |> DataFrame.mutate(alternative_hypothesis: 1 - wilcoxon_token_out, relative_median_difference: relative_median_difference * 100,
+      relative_median_difference_time: relative_median_difference_time * 100,
+    alternative_hypothesis_time: 1 - wilcoxon_time,
+    significance: 
+      if wilcoxon_token_out > 0.05 do 
+        "" 
+      else 
+        if wilcoxon_token_out > 0.01 do
+          "*"
+        else
+          if wilcoxon_token_out > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end,
+    significance_time: 
+      if wilcoxon_time > 0.05 do 
+        "" 
+      else 
+        if wilcoxon_time > 0.01 do
+          "*"
+        else
+          if wilcoxon_time > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end
+  )
+  |> DataFrame.transform(fn r ->
+    [key: "#{r["model"]} (t = #{r["temperature"]})"]
+  end)
+|> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+vl = VegaLite.new(title: "Workstation")
+|> VegaLite.concat(
+  [
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_ws_without_input,
+  only: ["key", "field", "diff_median_token_out", "active_parameters", "significance"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, axis: nil, sort: [field: "active_parameters"])
+|> VegaLite.encode_field(:y, "diff_median_token_out", 
+  aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-50, 110]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], 
+    title: "Absolute Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_token_out >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_token_out < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+]),
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_ws_without_input,
+  only: ["key", "field", "relative_median_difference", "active_parameters", "significance"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, sort: [field: "active_parameters"], title: "Model and Temperature")
+|> VegaLite.encode_field(:y, "relative_median_difference", aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-10, 20]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], label_expr: "datum.label + '%'"],
+  title: "Relative Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal) 
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+])
+  ], :vertical
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/wilcoxon-ws.pdf")
+
+vl
+```
+
+```elixir
+vl = VegaLite.new(title: "Workstation")
+|> VegaLite.concat(
+  [
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_ws_without_input,
+  only: ["key", "field", "diff_median_time", "active_parameters", "significance_time"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, axis: nil, sort: [field: "active_parameters"])
+|> VegaLite.encode_field(:y, "diff_median_time", 
+  aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-6,8]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], 
+    title: "Absolute Difference Median in s")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_time >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.diff_median_time < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal)
+]),
+    VegaLite.new(width: 750, height: 180)
+|> VegaLite.data_from_values(result_ws_without_input,
+  only: ["key", "field", "relative_median_difference_time", "active_parameters", "significance_time"]
+)
+|> VegaLite.encode_field(:x, "key", type: :nominal, sort: [field: "active_parameters"], title: "Model and Temperature")
+|> VegaLite.encode_field(:y, "relative_median_difference_time", aggregate: :median, 
+  type: :quantitative, 
+  scale: [domain: [-14, 20]],
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], label_expr: "datum.label + '%'"],
+  title: "Relative Difference Median")
+|> VegaLite.encode_field(:x_offset, "field", type: :nominal) 
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "field", type: :nominal, title: "Language style"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference_time >= 0")
+  |> VegaLite.mark(:text,
+    baseline: "top",
+    dy: -12)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.relative_median_difference_time < 0")
+  |> VegaLite.mark(:text,
+    baseline: "bottom",
+    dy: 13)
+  |> VegaLite.encode_field(:text, "significance_time", type: :nominal)
+])
+  ], :vertical
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/wilcoxon-time-ws.pdf")
+
+vl
+```
+
+```elixir
+a_ws = result_ws_without_input
+#|> DataFrame.filter(model != "llama4:scout")
+|> DataFrame.group_by("field")
+|> DataFrame.summarise(relative_median_difference: relative_median_difference, parameters: parameters, active_parameters: active_parameters, field_list: field, temperature: first(temperature), hardware: first(hardware))
+|> DataFrame.to_rows()
+```
+
+```elixir
+colors = %{"simple" => "#eb7f83", "friendly" => "#ffc57e", "academic" => "#97abff"}
+drop = ["field", "temperature", "hardware"]
+
+VegaLite.new(title: "Count of parameters vs. Quotient of Median Differences (#{result_ws_without_input["hardware"][0]})", width: 400)
+|> VegaLite.layers(
+      Enum.map(a_ws, fn %{"field" => field} = x ->
+        color = Map.get(colors, field)
+
+        VegaLite.new(title: "temperature = #{x["temperature"]}")
+        |> VegaLite.data_from_values(Map.drop(x, drop))
+        |> VegaLite.layers([
+          VegaLite.new()
+          |> VegaLite.mark(:point, color: color)
+          |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative)
+          |> VegaLite.encode_field(:y, "relative_median_difference", type: :quantitative, scale: [domain: [-9, 18]], axis: %{"labelExpr" => "datum.label + '%'"}, title: "Quotient median difference")
+          |> VegaLite.encode_field(:color, "field_list", type: :nominal, title: "language style"),
+          VegaLite.new()
+          |> VegaLite.mark(:line, color: color)
+          |> VegaLite.transform(regression: "relative_median_difference", on: "active_parameters")
+          |> VegaLite.transform(values: "field_list")
+          |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative, title: "Count of active parameters")
+          |> VegaLite.encode_field(:y, "relative_median_difference", type: :quantitative)
+        ])
+        end)
+)
+```
+
+```elixir
+result_ws
+|> DataFrame.group_by("model")
+|> DataFrame.summarise(n_failed_prompts: Series.median(n_failed_prompts), n_tokens_out_total: Series.median(n_tokens_out_total))
+```
+
+```elixir
+r1 = result_ws
+|> DataFrame.mutate(
+  energy: ground_truth_power_draw, 
+  energy_total: ground_truth_power_draw_total,
+  method: "ground_truth")
+
+r2 = result_ws
+|> DataFrame.mutate(
+  energy: power_draw, 
+  energy_total: power_draw_total,
+  method: "codecarbon")
+
+r3 = result_ws
+|> DataFrame.mutate(
+  energy: static_energy_estimation, 
+  energy_total: static_energy_estimation_total, 
+  method: "ml_emission_calculator")
+
+r_ws = DataFrame.concat_rows([r1, r2, r3])
+```
+
+```elixir
+VegaLite.new(width: 500, height: 300)
+|> VegaLite.data_from_values(r_ws,
+  only: ["model", "temperature", "energy", "method", "field"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log])
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:y_offset, "field", type: :nominal)
+|> VegaLite.encode_field(:color, "field", type: :nominal)
+|> VegaLite.encode_field(:opacity, "temperature", type: :nominal)
+|> VegaLite.encode_field(:shape, "method", type: :nominal)
+```
+
+## Combining Data of both hardwares
+
+```elixir
+r = r
+
+total = DataFrame.concat_rows(r, r_ws)
+```
+
+```elixir
+VegaLite.new(width: 500, height: 500)
+|> VegaLite.data_from_values(total,
+  only: ["model", "temperature", "energy", "method", "field", "architecture"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log])
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:y_offset, "architecture", type: :nominal)
+|> VegaLite.encode_field(:color, "field", type: :nominal)
+|> VegaLite.encode_field(:opacity, "temperature", type: :nominal)
+|> VegaLite.encode_field(:shape, "method", type: :nominal)
+```
+
+```elixir
+families = %{
+  "gemma3:4b" => "Gemma",
+  "gemma4:e4b" => "Gemma",
+  "gemma4:31b" => "Gemma",
+  "tinyllama:1.1b" => "Llama",
+  "llama4:scout" => "Llama",
+  "gemma4:12b" => "Gemma",
+  "mistral:7b" => "Mistral",
+  "magistral:24b" => "Mistral",
+  "mistral-small3.2:24b" => "Mistral",
+  "llama3.2:3b" => "Llama"
+}
+
+total = total
+|> DataFrame.put("family",
+  Series.transform(total["model"], fn model -> Map.get(families, model) end))
+```
+
+```elixir
+total_ground_truth = total
+|> DataFrame.filter(method == "ground_truth")
+
+total_static = total
+|> DataFrame.filter(method == "ml_emission_calculator")
+
+total_dynamic = total
+|> DataFrame.filter(method == "codecarbon")
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6InBvaW50IiwiY29sb3JfZmllbGQiOiJmaWVsZCIsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOiJub21pbmFsIiwiZGF0YV92YXJpYWJsZSI6InRvdGFsX2dyb3VuZF90cnV0aCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6ImVuZXJneSIsInhfZmllbGRfYWdncmVnYXRlIjoibWVhbiIsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOiJsb2ciLCJ4X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUiLCJ5X2ZpZWxkIjoibW9kZWwiLCJ5X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieV9maWVsZF9iaW4iOm51bGwsInlfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieV9maWVsZF90eXBlIjoibm9taW5hbCJ9XSwidmxfYWxpYXMiOiJFbGl4aXIuVmVnYUxpdGUiLCJ3aWR0aCI6NTAwfQ","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new(width: 500)
+|> VegaLite.data_from_values(total_ground_truth, only: ["energy", "model", "field"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy",
+  type: :quantitative,
+  aggregate: :mean,
+  scale: [type: :log]
+)
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:color, "field", type: :nominal)
+```
+
+```elixir
+total_ground_truth = total_ground_truth
+|> DataFrame.sort_by([family, temperature])
+```
+
+```elixir
+vl = VegaLite.new(width: 400, height: 220)
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["n_tokens_out_total", "model", "hardware", "family", "active_parameters"]
+)
+|> VegaLite.mark(:boxplot, size: 8)
+|> VegaLite.encode_field(:x, "n_tokens_out_total", type: :quantitative, title: "Amount of generated tokens")
+|> VegaLite.encode_field(:y, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:y_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware")
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/model-token.pdf")
+
+vl
+```
+
+```elixir
+vl = VegaLite.new(width: 400, height: 220)
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["n_tokens_out_total", "model", "temperature", "family"]
+)
+|> VegaLite.mark(:boxplot, size: 8)
+|> VegaLite.encode_field(:x, "n_tokens_out_total", type: :quantitative, title: "Amount of generated tokens")
+|> VegaLite.encode_field(:y, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:y_offset, "temperature", type: :nominal)
+|> VegaLite.encode_field(:color, "temperature", type: :nominal, title: "Temperature")
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/temperature-token.pdf")
+
+vl
+```
+
+```elixir
+a = total_ground_truth
+|> DataFrame.group_by(["model"])
+|> DataFrame.summarise(mean: round(mean(n_tokens_out), 0), energy: round(mean(energy),2), active_parameters: first(active_parameters))
+|> DataFrame.mutate(energy_per_token: round(energy / mean, 5))
+  |> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(a, only: ["model", "energy_per_token", "energy", "active_parameters"])
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", sort: ["active_parameters"], type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:y, "energy_per_token", type: :quantitative, title: "Consumed Energy per token in Ws")
+  |> VegaLite.encode_field(:color, "active_parameters", type: :quantitative, title: "Active Parameter Count"),
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", sort: ["active_parameters"], type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:y, "energy", type: :quantitative, title: "Consumed Energy per prompt in Ws")
+  |> VegaLite.encode_field(:color, "active_parameters", type: :quantitative, title: "Active Parameter Count")
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/energy-per-token.pdf")
+
+vl
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6InBvaW50IiwiY29sb3JfZmllbGQiOiJtb2RlbCIsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOiJub21pbmFsIiwiZGF0YV92YXJpYWJsZSI6InRvdGFsX2dyb3VuZF90cnV0aCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6ImVuZXJneSIsInhfZmllbGRfYWdncmVnYXRlIjoibWVhbiIsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOiJsb2ciLCJ4X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUiLCJ5X2ZpZWxkIjoiYXJjaGl0ZWN0dXJlIiwieV9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInlfZmllbGRfYmluIjpudWxsLCJ5X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInlfZmllbGRfdHlwZSI6Im5vbWluYWwifV0sInZsX2FsaWFzIjoiRWxpeGlyLlZlZ2FMaXRlIiwid2lkdGgiOm51bGx9","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["energy", "architecture", "model"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "energy",
+  type: :quantitative,
+  aggregate: :mean,
+  scale: [type: :log]
+)
+|> VegaLite.encode_field(:y, "architecture", type: :nominal)
+|> VegaLite.encode_field(:color, "model", type: :nominal)
+```
+
+```elixir
+total
+|> DataFrame.group_by(["model"])
+|> DataFrame.summarise(mean_failed_prompts: median(n_failed_prompts), relative_failed_prompts: sum(n_failed_prompts) / sum(n_samples), parameters: first(parameters))
+|> DataFrame.sort_by([parameters])
+|> DataFrame.select(["model", "mean_failed_prompts", "relative_failed_prompts"])
+```
+
+```elixir
+total
+|> DataFrame.group_by("hardware")
+|> DataFrame.mutate(
+  corr_static_ground: correlation(static_energy_estimation_total, ground_truth_power_draw_total),
+  corr_dynamic_ground: correlation(power_draw_total, ground_truth_power_draw_total)
+)
+|> DataFrame.summarise(corr_static_ground: round(first(corr_static_ground), 3), corr_dynamic_ground: round(first(corr_dynamic_ground), 3))
+```
+
+## Analysis of methods
+
+```elixir
+methods = %{"ml_emission_calculator" => "Static Estimation", 
+  "codecarbon" => "Dynamic Estimation", 
+  "ground_truth" => "Ground Truth"}
+
+total = total
+|> DataFrame.mutate(
+  absolute_error: ground_truth_power_draw - energy,
+  absolute_error_abs: abs(ground_truth_power_draw - energy),
+  relative_error: ((energy / ground_truth_power_draw) * 100) - 100,
+  relative_power_error: (((energy / running_time) / (ground_truth_power_draw / running_time)) * 100) - 100,
+  power: energy / running_time,
+  power_total: energy_total / running_time_total
+)
+|> DataFrame.transform(
+  [names: ["model", "temperature", "field", "architecture", "hardware", "method"]],
+  fn row ->
+    %{
+      key_total: "#{row["model"]}@#{row["architecture"]}, t=#{row["temperature"]}, field=#{row["field"]}",
+      key_architecture: "#{row["model"]}@#{row["architecture"]}",
+      key_hardware: "#{row["model"]}@#{row["hardware"]}",
+      key_configuration: "#{row["model"]}@#{row["hardware"]}, t=#{row["temperature"]}",
+      key_method: Map.get(methods, row["method"])
+    }
+  end
+)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6InBvaW50IiwiY29sb3JfZmllbGQiOiJtZXRob2QiLCJjb2xvcl9maWVsZF9hZ2dyZWdhdGUiOm51bGwsImNvbG9yX2ZpZWxkX2JpbiI6bnVsbCwiY29sb3JfZmllbGRfc2NhbGVfc2NoZW1lIjpudWxsLCJjb2xvcl9maWVsZF90eXBlIjoibm9taW5hbCIsImRhdGFfdmFyaWFibGUiOiJ0b3RhbCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6ImFjdGl2ZV9wYXJhbWV0ZXJzIiwieF9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInhfZmllbGRfdHlwZSI6InF1YW50aXRhdGl2ZSIsInlfZmllbGQiOiJyZWxhdGl2ZV9lcnJvciIsInlfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ5X2ZpZWxkX2JpbiI6bnVsbCwieV9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ5X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUifV0sInZsX2FsaWFzIjoiRWxpeGlyLlZlZ2FMaXRlIiwid2lkdGgiOjQwMH0","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new(width: 400)
+|> VegaLite.data_from_values(total,
+  only: ["active_parameters", "relative_error", "method"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "active_parameters", type: :quantitative)
+|> VegaLite.encode_field(:y, "relative_error", type: :quantitative)
+|> VegaLite.encode_field(:color, "method", type: :nominal)
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "power", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:y, "power", type: :quantitative, scale: [domain: [0, 500]], aggregate: :mean, title: "Power in W")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 240, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["model", "power", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:y, "power", type: :quantitative, scale: [domain: [0, 500]], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal)
+  ], :horizontal),
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "energy", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:y, "energy", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: "Energy in Ws")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 240, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "energy", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:y, "energy", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal)
+  ], :horizontal),
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "absolute_error_abs", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, title: "DGX Spark")
+    |> VegaLite.encode_field(:y, "absolute_error_abs", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: "Absolute Error in Ws")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 240, height: 150)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "absolute_error_abs", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:x, "model", sort: "hardware", type: :nominal, title: "Workstation")
+    |> VegaLite.encode_field(:y, "absolute_error_abs", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal, title: "Tracking Method")
+  ], :horizontal)
+], :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/tracking_methods.pdf")
+
+vl
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "power", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, title: "DGX Spark")
+    |> VegaLite.encode_field(:x, "power", type: :quantitative, scale: [domain: [0, 500]], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["model", "power", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, title: "Workstation")
+    |> VegaLite.encode_field(:x, "power", type: :quantitative, scale: [domain: [0, 500]], aggregate: :mean, title: "Power in W")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal)
+  ], :vertical),
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "energy", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "energy", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: "Energy in Ws")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal)
+  ], :vertical),
+  VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "absolute_error_abs", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:x, "absolute_error_abs", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: nil, axis: [labels: false, ticks: false, domain: false])
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal),
+    VegaLite.new(width: 200, height: 200)
+    |> VegaLite.data_from_values(total,
+      only: ["key_hardware", "model", "absolute_error_abs", "key_method", "hardware"]
+    )
+    |> VegaLite.mark(:point)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, axis: nil)
+    |> VegaLite.encode_field(:x, "absolute_error_abs", type: :quantitative, scale: [domain: [1, 50000], type: :log], aggregate: :mean, title: "Absolute Error in Ws")
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal, title: "Tracking Method")
+  ], :vertical)
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/tracking_methods-folie.pdf")
+
+vl
+```
+
+## Analysis of hardware
+
+```elixir
+total
+|> DataFrame.group_by(["hardware", "model", "method"])
+|> DataFrame.summarise(power: mean(power), energy: mean(energy), 
+  absolute_error: mean(absolute_error_abs), relative_error: median(relative_error),
+  relative_power_error: mean(relative_power_error)
+)
+|> DataFrame.filter(hardware == "Workstation" and model in ["gemma4:31b", "llama4:scout"])
+```
+
+```elixir
+hw_analysis = total_ground_truth
+|> DataFrame.filter(hardware == "DGX Spark")
+|> DataFrame.join(DataFrame.filter(total_ground_truth, hardware == "Workstation"), 
+  on: [model: :model, temperature: :temperature, field: :field, 
+    dataset_model: :dataset_model])
+|> DataFrame.mutate(
+  energy_absolute_difference_abs: abs(energy - energy_right),
+  energy_absolute_difference: -1 * (energy_right - energy),
+  energy_relative_difference: (-1 * (energy_right - energy) / energy_right) * 100,
+  time_absolute_difference_abs: abs(running_time_total - running_time_total_right),
+  time_absolute_difference: -1 * (running_time_total_right - running_time_total),
+  time_relative_difference: (-1 * (running_time_total_right - running_time_total) / running_time_total_right) * 100
+)
+|> DataFrame.sort_by(active_parameters)
+#|> DataFrame.filter(dataset_model != "GPT5-mini-Studierende")
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(hw_analysis
+)
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.concat([
+    
+    VegaLite.new(width: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:y, "running_time_total", type: :quantitative, scale: [type: :log], title: "Total Values")
+    |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:x, "model", type: :nominal)
+  |> VegaLite.encode_field(:y, "running_time_total_right", type: :quantitative, scale: [type: :log], title: "")
+    |> VegaLite.encode_field(:x_offset, "hardware_right", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware_right", type: :nominal)
+  ]),
+  VegaLite.new(width: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:y, "time_absolute_difference", type: :quantitative, 
+    title: "Absolute Difference")#,  scale: [type: :log])
+  ]),
+    VegaLite.new(width: 200, height: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: "Running Time in s")
+  |> VegaLite.encode_field(:y, "time_relative_difference", type: :quantitative, 
+    axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"],
+    label_expr: "datum.label + '%'"],
+    title: "Relative Difference")
+  ])], :vertical),
+  VegaLite.new()
+  |> VegaLite.concat([
+    
+    VegaLite.new(width: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:y, "energy", type: :quantitative, scale: [type: :log], title: nil)
+    |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:x, "model", type: :nominal)
+  |> VegaLite.encode_field(:y, "energy_right", type: :quantitative, scale: [type: :log])
+    |> VegaLite.encode_field(:x_offset, "hardware_right", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware_right", type: :nominal, title: "Hardware")
+  ]),
+  VegaLite.new(width: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:y, "energy_absolute_difference", type: :quantitative, title: nil,
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]])
+  ]),
+    VegaLite.new(width: 200, height: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:x, "model", type: :nominal, title: "Energy Consumption (Ground Truth) in Ws")
+  |> VegaLite.encode_field(:y, "energy_relative_difference", type: :quantitative, title: nil, 
+    axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"],
+    label_expr: "datum.label + '%'"]
+  )
+])
+  ], :vertical)
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/hardware-differences.pdf")
+
+vl
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(hw_analysis
+)
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.concat([
+    
+    VegaLite.new(width: 200, height: 200, title: "Total Values")
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:y, "model", type: :nominal, title: "Running Time in s")
+  |> VegaLite.encode_field(:x, "running_time_total", type: :quantitative, scale: [type: :log], title: nil)
+    |> VegaLite.encode_field(:y_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:y, "model", type: :nominal)
+  |> VegaLite.encode_field(:x, "running_time_total_right", type: :quantitative, scale: [type: :log], title: "")
+    |> VegaLite.encode_field(:y_offset, "hardware_right", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware_right", type: :nominal)
+  ]),
+  VegaLite.new(width: 200, height: 200, title: "Absolute Difference")
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:y, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:x, "time_absolute_difference", type: :quantitative, 
+    title: nil)#,  scale: [type: :log])
+  ]),
+    VegaLite.new(width: 200, height: 200, title: "Relative Difference")
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:y, "model", type: :nominal, axis: nil, title: nil)
+  |> VegaLite.encode_field(:x, "time_relative_difference", type: :quantitative, 
+    axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], label_expr: "datum.label + '%'"],
+    title: nil)
+  ])], :horizontal),
+  VegaLite.new()
+  |> VegaLite.concat([
+    
+    VegaLite.new(width: 200, height: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:y, "model", type: :nominal, title: "Energy Consumption (Ground Truth) in Ws")
+  |> VegaLite.encode_field(:x, "energy", type: :quantitative, scale: [type: :log], title: nil)
+    |> VegaLite.encode_field(:y_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot)
+  |> VegaLite.encode_field(:y, "model", type: :nominal)
+  |> VegaLite.encode_field(:x, "energy_right", type: :quantitative, scale: [type: :log], title: "")
+    |> VegaLite.encode_field(:y_offset, "hardware_right", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware_right", type: :nominal, title: "Hardware")
+  ]),
+  VegaLite.new(width: 200, height: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:y, "model", type: :nominal, title: nil, axis: nil)
+  |> VegaLite.encode_field(:x, "energy_absolute_difference", type: :quantitative, title: nil,
+  axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]])
+  ]),
+    VegaLite.new(width: 200, height: 200)
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:boxplot, color: :green, rule: [color: :black])
+  |> VegaLite.encode_field(:y, "model", type: :nominal, axis: nil, title: nil)
+  |> VegaLite.encode_field(:x, "energy_relative_difference", type: :quantitative, 
+    axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"],
+    label_expr: "datum.label + '%'"],
+    title: nil
+  )
+])
+  ], :horizontal)
+], :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/hardware-differences-folien.pdf")
+
+vl
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6ImJhciIsImNvbG9yX2ZpZWxkIjoidGVtcGVyYXR1cmUiLCJjb2xvcl9maWVsZF9hZ2dyZWdhdGUiOm51bGwsImNvbG9yX2ZpZWxkX2JpbiI6bnVsbCwiY29sb3JfZmllbGRfc2NhbGVfc2NoZW1lIjpudWxsLCJjb2xvcl9maWVsZF90eXBlIjoibm9taW5hbCIsImRhdGFfdmFyaWFibGUiOiJ0b3RhbF9ncm91bmRfdHJ1dGgiLCJnZW9kYXRhX2NvbG9yIjoiYmx1ZSIsImxhdGl0dWRlX2ZpZWxkIjpudWxsLCJsb25naXR1ZGVfZmllbGQiOm51bGwsInhfZmllbGQiOiJydW5uaW5nX3RpbWVfdG90YWwiLCJ4X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieF9maWVsZF9iaW4iOjI1LCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInhfZmllbGRfdHlwZSI6InF1YW50aXRhdGl2ZSIsInlfZmllbGQiOiJoYXJkd2FyZSIsInlfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ5X2ZpZWxkX2JpbiI6bnVsbCwieV9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ5X2ZpZWxkX3R5cGUiOiJub21pbmFsIn1dLCJ2bF9hbGlhcyI6IkVsaXhpci5WZWdhTGl0ZSIsIndpZHRoIjpudWxsfQ","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["running_time_total", "hardware", "temperature"]
+)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "running_time_total",
+  type: :quantitative,
+  bin: [maxbins: 25]
+)
+|> VegaLite.encode_field(:y, "hardware", type: :nominal)
+|> VegaLite.encode_field(:color, "temperature", type: :nominal)
+```
+
+## Analysis of language style
+
+```elixir
+total_without_input = total
+|> DataFrame.filter(field != "input")
+  |> DataFrame.mutate(alternative_hypothesis: 1 - wilcoxon_token_out, relative_median_difference: relative_median_difference * 100, relative_median_difference_time: relative_median_difference_time * 100)
+  |> DataFrame.transform(fn r ->
+    [key: "#{r["model"]} (t = #{r["temperature"]})"]
+  end)
+|> DataFrame.sort_by(parameters)
+```
+
+```elixir
+a_total = total_without_input
+|> DataFrame.mutate(field: (if field == "input", do: "original", else: field))
+|> DataFrame.group_by("field")
+|> DataFrame.summarise(relative_median_difference: relative_median_difference, parameters: parameters, active_parameters: active_parameters, field_list: field, temperature: first(temperature), hardware: first(hardware))
+|> DataFrame.to_rows()
+```
+
+```elixir
+total_without_input
+|> DataFrame.group_by("field")
+|> DataFrame.filter(method == "ground_truth" and alternative_hypothesis >= 0.95)
+|> DataFrame.summarise(
+  amount: count(relative_median_difference),
+  mean: round(mean(relative_median_difference), 2), 
+  median: round(median(relative_median_difference), 2),
+  standard_deviation: round(standard_deviation(relative_median_difference), 2)
+)
+```
+
+```elixir
+total_without_input
+|> DataFrame.group_by("field")
+|> DataFrame.filter(method == "ground_truth" and wilcoxon_time <= 0.05)
+|> DataFrame.summarise(
+  amount: count(relative_median_difference_time),
+  mean: round(mean(relative_median_difference_time), 2), 
+  median: round(median(relative_median_difference_time), 2),
+  standard_deviation: round(standard_deviation(relative_median_difference_time), 2)
+)
+```
+
+```elixir
+colors = %{"simple" => "#eb7f83", "friendly" => "#ffc57e", "academic" => "#97abff"}
+drop = ["field", "temperature", "hardware"]
+
+vl = VegaLite.new(width: 400)
+|> VegaLite.layers(
+      Enum.map(a_total, fn %{"field" => field} = x ->
+        color = Map.get(colors, field)
+
+        VegaLite.new()
+        |> VegaLite.data_from_values(Map.drop(x, drop))
+        |> VegaLite.layers([
+          VegaLite.new()
+          |> VegaLite.mark(:point, color: color)
+          |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative, title: "Count of active parameters")
+          |> VegaLite.encode_field(:y, "relative_median_difference", type: :quantitative, scale: [domain: [-10, 18]], axis: %{"labelExpr" => "datum.label + '%'"}, title: "Relative Median Difference")
+          |> VegaLite.encode_field(:color, "field_list", type: :nominal, title: "Language style")
+        ])
+        end)
+      
+    
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/regression-quotient.pdf")
+
+vl
+```
+
+## Analysis of model
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")  
+|> DataFrame.group_by(["hardware", "model"])
+|> DataFrame.summarise(running_time_total: cast(sum(running_time_total), :integer), running_time_mean: cast(mean(running_time_total), :integer), active_parameters: first(active_parameters), energy_total: sum(energy_total) / 3.6e6)
+|> DataFrame.sort_by([hardware, active_parameters])
+|> DataFrame.mutate(duration: cast(1000 * running_time_total, {:duration, :millisecond}))
+```
+
+```elixir
+total
+|> DataFrame.filter(method == "ground_truth")  
+|> DataFrame.group_by(["model"])
+|> DataFrame.summarise(running_time_total: cast(sum(running_time_total), :integer), active_parameters: first(active_parameters), energy_total: round(sum(energy_total) / 3.6e6, 2))
+|> DataFrame.sort_by([active_parameters])
+|> DataFrame.select(["model", "running_time_total", "energy_total"])
+```
+
+```elixir
+VegaLite.new(title: "Sum of all running times per model and hardware")
+|> VegaLite.data_from_values(x, only: ["model", "running_time_total", "hardware", "active_parameters"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: [field: "active_parameters"], title: "LLM")
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "running_time_total", type: :quantitative, title: "Running time in seconds")
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware")
+```
+
+```elixir
+VegaLite.new(title: "Mean of all running times per model and hardware")
+|> VegaLite.data_from_values(x, only: ["model", "running_time_mean", "hardware", "active_parameters"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: [field: "active_parameters"], title: "LLM")
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "running_time_mean", type: :quantitative, title: "Running time in seconds")
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware")
+```
+
+```elixir
+vl = VegaLite.new(width: 300)
+|> VegaLite.data_from_values(x, only: ["running_time_total", "hardware", "model", "active_parameters"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "running_time_total", type: :quantitative, title: "Running times in seconds")
+|> VegaLite.encode_field(:y, "hardware", type: :nominal, title: "Hardware")
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/running_times_all.pdf")
+
+vl
+```
+
+```elixir
+vl = VegaLite.new(width: 300)
+|> VegaLite.data_from_values(x, only: ["energy_total", "hardware", "model", "active_parameters"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "energy_total", type: :quantitative, title: "Consumed Energy (Ground Truth) in kWh")
+|> VegaLite.encode_field(:y, "hardware", type: :nominal, title: "Hardware")
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/energy_all.pdf")
+
+vl
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by("hardware")
+|> DataFrame.summarise(running_time: sum(running_time_total), energy: sum(energy_total) / 3.6e6, amount: count(energy_total))
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+```
+
+```elixir
+total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by("hardware")
+|> DataFrame.summarise(running_time: mean(running_time_total))
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by("field")
+|> DataFrame.summarise(running_time: sum(running_time_total), energy: sum(energy_total) / 3.6e6)
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by(["hardware", "model"])
+|> DataFrame.summarise(correlation: correlation(running_time_total, energy), running_time: round(mean(running_time_total), 0), energy: round(mean(energy_total) / 3.6e6, 2), active_parameters: first(active_parameters), parameters: first(parameters))
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+|> DataFrame.sort_by([active_parameters])
+```
+
+```elixir
+VegaLite.new()
+|> VegaLite.concat(
+  [
+    VegaLite.new()
+|> VegaLite.data_from_values(x, only: ["energy", "model", "hardware"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative)
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal),
+    VegaLite.new()
+|> VegaLite.data_from_values(x, only: ["running_time", "model", "hardware"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "running_time", type: :quantitative)
+|> VegaLite.encode_field(:y, "model", type: :nominal)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal)
+  ], :vertical
+)
+```
+
+```elixir
+VegaLite.new(title: "Running time vs. Energy Consumption per model", width: 300, height: 200)
+|> VegaLite.data_from_values(x, only: ["running_time", "energy", "model", "hardware"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "running_time", type: :quantitative, title: "Running Time")
+|> VegaLite.encode_field(:y, "energy", type: :quantitative, title: "Consumed Energy (Ground Truth)")
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:shape, "hardware", type: :nominal, title: "Hardware")
+```
+
+```elixir
+x = total_ground_truth
+#|> DataFrame.mutate(energy_total: round(energy_total / 3.6e6, 2))
+```
+
+```elixir
+vl = VegaLite.new(width: 300)
+|> VegaLite.data_from_values(x,
+  only: ["n_tokens_out_total", "energy_total", "model", "hardware"]
+)
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "n_tokens_out_total", type: :quantitative, scale: [type: :log], title: "Amount of Generated Tokens")
+|> VegaLite.encode_field(:y, "energy_total", type: :quantitative, scale: [type: :log], title: "Consumed Energy (Ground Truth)")
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/token-energy.pdf")
+
+vl
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by(["hardware", "model"])
+|> DataFrame.summarise(correlation: correlation(running_time_total, energy), running_time: mean(running_time_total), energy: mean(energy_total) / 3.6e6, active_parameters: first(active_parameters), parameters: first(parameters))
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+|> DataFrame.sort_by([active_parameters])
+```
+
+```elixir
+t = DataFrame.mutate(total_ground_truth, energy_total: energy_total / 3.6e6)
+
+xx = x
+#|> DataFrame.filter(model not in ["gemma4:12b", "llama3.2:3b", "mistral-small3.2:24b"])
+
+vl = VegaLite.new()
+|> VegaLite.layers(
+  [
+    VegaLite.new(width: 400, height: 300)
+|> VegaLite.data_from_values(xx, only: ["running_time", "energy", "model", "hardware"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "running_time", type: :quantitative, title: "Running Time in seconds", scale: [type: :log])
+|> VegaLite.encode_field(:y, "energy", type: :quantitative, title: "", scale: [type: :log])
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:shape, "hardware", type: :nominal, title: "Hardware"),
+    VegaLite.new()
+    |> VegaLite.data_from_values(t, only: ["running_time_total", "energy_total", "model", "hardware"])
+    |> VegaLite.mark(:point, opacity: 0.25)
+|> VegaLite.encode_field(:x, "running_time_total", type: :quantitative, title: "", scale: [type: :log])
+|> VegaLite.encode_field(:y, "energy_total", type: :quantitative, title: "Consumed Energy (Ground Truth) in kWh", scale: [type: :log])
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:shape, "hardware", type: :nominal, title: "Hardware")
+  ]
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/model-running-time-energy.pdf")
+
+vl
+```
+
+```elixir
+t3 = DataFrame.mutate(total_ground_truth, energy_total: energy_total / 3.6e6)
+|> DataFrame.filter(dataset_model == "gemma3_27b")
+```
+
+```elixir
+tt = t
+|> DataFrame.group_by(["hardware"])
+|> DataFrame.mutate(energy_vs_running_time: correlation(running_time_total, energy_total))  
+|> DataFrame.summarise(count: count(field), energy_vs_running_time: first(energy_vs_running_time))
+|> DataFrame.to_rows()
+```
+
+```elixir
+t3
+|> DataFrame.group_by(["hardware"])
+|> DataFrame.mutate(energy_vs_running_time: correlation(running_time_total, energy_total))  
+|> DataFrame.summarise(count: count(field), energy_vs_running_time: first(energy_vs_running_time))
+|> DataFrame.to_rows()
+```
+
+```elixir
+colors = %{"Workstation" => :orange, "DGX Spark" => :blue}
+
+vl = VegaLite.new()
+|> VegaLite.layers(
+  [
+    VegaLite.new(width: 400, height: 300 
+    )
+|> VegaLite.data_from_values(xx, only: ["running_time", "energy", "model", "hardware"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "running_time", type: :quantitative, title: "", scale: [type: :log])
+|> VegaLite.encode_field(:y, "energy", type: :quantitative, title: "Consumed Energy (Ground Truth) in kWh", scale: [type: :log])
+#|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware"),
+    VegaLite.new()
+    |> VegaLite.data_from_values(t, only: ["running_time_total", "energy_total", "model", "hardware"])
+    |> VegaLite.mark(:point, opacity: 0.25)
+|> VegaLite.encode_field(:x, "running_time_total", type: :quantitative, title: "Running Time in seconds")
+|> VegaLite.encode_field(:y, "energy_total", type: :quantitative, title: "")
+#|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware"),
+    VegaLite.new()
+    |> VegaLite.layers(
+      tt
+      |> Enum.map(fn %{"hardware" => hardware} ->
+        df = DataFrame.filter(t3, hardware == ^hardware)
+        
+        VegaLite.new()
+    |> VegaLite.data_from_values(df, only: ["running_time_total", "energy_total", "model"])
+    |> VegaLite.mark(:line, color: Map.get(colors, hardware))
+    |> VegaLite.transform(regression: "energy_total", on: "running_time_total")
+|> VegaLite.encode_field(:x, "running_time_total", type: :quantitative, title: "")
+|> VegaLite.encode_field(:y, "energy_total", type: :quantitative, title: "")
+      end)
+    )
+  ]
+)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/regression-model.pdf")
+
+vl
+```
+
+```elixir
+VegaLite.new()
+    |> VegaLite.data_from_values(t3 |> DataFrame.filter(hardware == "DGX Spark"), only: ["running_time_total", "energy_total", "model"])
+    |> VegaLite.mark(:text)
+    |> VegaLite.transform(regression: "energy_total", on: "running_time_total", params: true)
+    |> VegaLite.transform(calculate: "'Spark R²: '+format(datum.rSquared, '.3f')", as: "R2")
+      |> VegaLite.encode_field(:text, "R2", type: :nominal, field: "R2")
+```
+
+```elixir
+VegaLite.new()
+    |> VegaLite.data_from_values(t |> DataFrame.filter(hardware == "Workstation"), only: ["running_time_total", "energy_total", "model"])
+    |> VegaLite.mark(:text)
+    |> VegaLite.transform(regression: "energy_total", on: "running_time_total", params: true)
+    |> VegaLite.transform(calculate: "'Workstation R²: '+format(datum.rSquared, '.3f')", as: "R2")
+      |> VegaLite.encode_field(:text, "R2", type: :nominal, field: "R2")
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(x,
+  only: ["active_parameters", "running_time", "energy", "model", "parameters", "hardware"]
+)
+|> VegaLite.concat([
+  VegaLite.new(width: 200)
+  |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.mark(:point)
+    |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative, title: "Active Parameter Count (DGX Spark)", scale: [domain: [100000000, 50000000000],type: :log])
+    |> VegaLite.encode_field(:y, "running_time", type: :quantitative, title: "Mean Running Time in s", scale: [domain: [1, 500000], type: :log])
+  |> VegaLite.encode_field(:color, "model", type: :nominal),
+  VegaLite.new(width: 200)
+  |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.mark(:point)
+    |> VegaLite.encode_field(:x, "active_parameters", type: :quantitative, title: "Active Parameter Count (Workstation)", scale: [domain: [100000000, 50000000000], type: :log])
+    |> VegaLite.encode_field(:y, "running_time", type: :quantitative, title: nil, scale: [domain: [1, 500000], type: :log])
+  |> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/parameter-running-time.pdf")
+
+vl
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by("temperature")
+|> DataFrame.summarise(running_time: round(mean(running_time_total), 0), energy: round(mean(energy_total) / 3.6e6, 2))
+|> DataFrame.sort_by(temperature)
+```
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(x, only: ["temperature", "running_time", "energy"])
+|> VegaLite.concat(
+  [
+    VegaLite.new()
+    |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "temperature", type: :nominal)
+|> VegaLite.encode_field(:y, "running_time", type: :quantitative),
+    VegaLite.new()
+    |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "temperature", type: :nominal)
+|> VegaLite.encode_field(:y, "energy", type: :quantitative)
+  ], :horizontal
+)
+```
+
+```elixir
+q = total
+|> DataFrame.filter(method == "ground_truth" and temperature == 0)
+|> DataFrame.summarise(mean: round(mean(energy_total), 1))
+
+w = total
+|> DataFrame.filter(method == "ground_truth" and temperature != 0)
+|> DataFrame.summarise(mean: round(mean(energy_total), 1))
+
+q[0][0]/w[0][0]
+```
+
+```elixir
+q = total
+|> DataFrame.filter(method == "ground_truth" and temperature == 0)
+|> DataFrame.summarise(mean_runtime: round(mean(running_time_total), 1))
+
+w = total
+|> DataFrame.filter(method == "ground_truth" and temperature != 0)
+|> DataFrame.summarise(mean_runtime: round(mean(running_time_total), 1))
+
+q[0][0]/w[0][0]
+```
+
+```elixir
+x = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.group_by(["temperature", "model", "hardware"])
+|> DataFrame.summarise(running_time: round(mean(running_time_total), 0), energy: round(mean(energy_total) / 3.6e6, 2), active_parameters: first(active_parameters))
+|> DataFrame.sort_by([hardware, active_parameters, model, temperature])
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(x, only: ["temperature", "running_time", "model", "energy", "active_parameters"])
+|> VegaLite.concat([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:y, "temperature", type: :nominal, title: "Temperature")
+|> VegaLite.encode_field(:x, "running_time", type: :quantitative, title: "Running Time in s")
+|> VegaLite.encode_field(:color, "model", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:y, "temperature", type: :nominal, title: nil, axis: nil)
+|> VegaLite.encode_field(:x, "energy", type: :quantitative, title: "Consumed Energy (Ground Truth) in kWh")
+|> VegaLite.encode_field(:color, "model", type: :nominal, title: "LLM")
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/temperature_all.pdf")
+
+vl
+```
+
+```elixir
+x = x
+|> DataFrame.mutate(temperature: if(temperature == 0, do: "zero", else: "seven"))
+|> DataFrame.pivot_wider("temperature", ["running_time", "energy", "active_parameters"])
+|> DataFrame.mutate(running_time_quotient: running_time_zero / running_time_seven,
+energy_quotient: energy_zero / energy_seven, active_parameters: active_parameters_zero)
+|> DataFrame.select(["model", "hardware", "running_time_quotient", "energy_quotient", "active_parameters"])
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.data_from_values(x,
+  only: ["model", "running_time_quotient", "energy_quotient", "hardware", "active_parameters"]
+)
+|> VegaLite.concat([
+  VegaLite.new(height: 90)
+  |> VegaLite.mark(:bar, size: 18)
+  |> VegaLite.encode_field(:x, "model", type: :nominal, sort: [field: "active_parameters"], title: nil, axis: nil)
+  |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:y, "running_time_quotient", type: :quantitative, title: "Quotient running time")
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new(height: 90)
+  |> VegaLite.mark(:bar, size: 18)
+  |> VegaLite.encode_field(:x, "model", type: :nominal, sort: [field: "active_parameters"], title: "LLM")
+  |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+  |> VegaLite.encode_field(:y, "energy_quotient", type: :quantitative, title: "Quotient energy")
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware")
+], :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/temperature.pdf")
+
+vl
+```
+
+```elixir
+x = total
+|> DataFrame.group_by("method")
+|> DataFrame.summarise(running_time: sum(running_time_total), energy: sum(energy_total) / 3.6e6)
+|> DataFrame.mutate(running_time_formatted: cast(running_time * 1000, {:duration, :millisecond}))
+```
+
+```elixir
+total_ground_truth = total
+|> DataFrame.filter(method == "ground_truth")
+|> DataFrame.mutate(energy_per_token: energy_total / n_tokens_out_total)
+```
+
+## Graphs for Workshop
+
+```elixir
+total_ground_truth_without_input = total_without_input
+|> DataFrame.filter(method == "ground_truth")
+  |> DataFrame.mutate(energy_per_token: energy_total / n_tokens_out_total)
+  |> DataFrame.mutate(abs_energy_diff: diff_median_token_out * energy_per_token)
+  |> DataFrame.mutate(rel_energy_diff: abs_energy_diff / ((median_token_out * energy_per_token) - abs_energy_diff))
+  |> DataFrame.group_by(["hardware", "model", "field"])
+  |> DataFrame.summarise(
+    rel_med_diff: mean(rel_energy_diff) * 100, 
+    wilcoxon_token_out: mean(wilcoxon_token_out), 
+    active_parameters: first(active_parameters)
+  )
+  |> DataFrame.mutate(
+    significance: 
+      if wilcoxon_token_out > 0.05 do 
+        "" 
+      else 
+        if wilcoxon_token_out > 0.01 do
+          "*"
+        else
+          if wilcoxon_token_out > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end
+  )
+|> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+font_size = 20
+vl =
+  VegaLite.new()
+  |> VegaLite.concat(
+    [
+      VegaLite.new(width: 500, title: [
+        text: "DGX Spark",
+        font_size: font_size
+      ])
+      |> VegaLite.data_from_values(total_ground_truth_without_input,
+        only: ["model", "field", "rel_med_diff", "active_parameters", "significance", "hardware"]
+      )
+      |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+      |> VegaLite.encode_field(:x, "model",
+        type: :nominal,
+        sort: [field: "active_parameters"],
+        title: nil,
+        axis: [
+          label_font_size: font_size
+        ]
+      )
+      |> VegaLite.encode_field(:y, "rel_med_diff",
+        aggregate: :median,
+        type: :quantitative,
+        scale: [domain: [-12, 18]],
+        axis: [
+          grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"],
+          label_expr: "datum.label + '%'",
+          label_font_size: font_size,
+          title_font_size: font_size
+        ],
+        title: "Relative Difference of Energy"
+      )
+      |> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+      |> VegaLite.layers([
+        VegaLite.new()
+        |> VegaLite.mark(:bar)
+        |> VegaLite.encode_field(:color, "field", type: :nominal, title: ""),
+        VegaLite.new()
+        |> VegaLite.transform(filter: "datum.rel_med_diff >= 0")
+        |> VegaLite.mark(:text,
+          baseline: "top",
+          dy: -12,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:text, "significance", type: :nominal),
+        VegaLite.new()
+        |> VegaLite.transform(filter: "datum.rel_med_diff < 0")
+        |> VegaLite.mark(:text,
+          baseline: "bottom",
+          dy: 20,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:text, "significance", type: :nominal)
+      ]),
+      VegaLite.new(width: 500, title: [
+        text: "Workstation",
+        font_size: font_size
+      ])
+      |> VegaLite.data_from_values(total_ground_truth_without_input,
+        only: ["model", "field", "rel_med_diff", "active_parameters", "significance", "hardware"]
+      )
+      |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+      |> VegaLite.encode_field(:x, "model",
+        type: :nominal,
+        sort: [field: "active_parameters"],
+        title: "Model",
+        axis: [
+          label_font_size: font_size,
+          title_font_size: font_size
+        ]
+      )
+      |> VegaLite.encode_field(:y, "rel_med_diff",
+        aggregate: :median,
+        type: :quantitative,
+        scale: [domain: [-10, 20]],
+        axis: [
+          grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"],
+          label_expr: "datum.label + '%'",
+          label_font_size: font_size,
+          title_font_size: font_size
+        ],
+        title: "Relative Difference of Energy"
+      )
+      |> VegaLite.encode_field(:x_offset, "field", type: :nominal)
+      |> VegaLite.layers([
+        VegaLite.new()
+        |> VegaLite.mark(:bar)
+        |> VegaLite.encode_field(:color, "field", 
+          type: :nominal, 
+          title: "Language style", 
+          legend: [
+            label_font_size: font_size,
+            title_font_size: font_size,
+            direction: :horizontal,
+            orient: "bottom"
+          ]
+        ),
+        VegaLite.new()
+        |> VegaLite.transform(filter: "datum.rel_med_diff >= 0")
+        |> VegaLite.mark(:text,
+          baseline: "top",
+          dy: -12,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:text, "significance", type: :nominal),
+        VegaLite.new()
+        |> VegaLite.transform(filter: "datum.rel_med_diff < 0")
+        |> VegaLite.mark(:text,
+          baseline: "bottom",
+          dy: 20,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:text, "significance", type: :nominal)
+      ])
+    ],
+    :vertical
+  )
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/wilcoxon-all.pdf")
+
+vl
+```
+
+```elixir
+total_ground_truth
+```
+
+## Analysis on Artifacts Level
+
+```elixir
+artifacts
+```
+
+```elixir
+artifacts_ws
+```
+
+```elixir
+q = artifacts
+|> DataFrame.discard(["status", "artifact_uri", "seconds", "dataset", "task", "dataset_name", "dataset_split", "dataset_n_samples", "dataset_seed", "dataset_flags", "file_size"])
+|> DataFrame.put("index", for(n <- Range.new(1, DataFrame.n_rows(artifacts)), do: Range.new(1, Enum.count(artifacts["times"][n - 1])) |> Enum.to_list()))
+|> DataFrame.put("family",
+  Series.transform(artifacts["model"], fn model -> Map.get(families, model) end))  
+|> DataFrame.explode(["times", "tokens_in", "tokens_out", "index"])
+```
+
+```elixir
+q_ws = artifacts_ws
+|> DataFrame.discard(["status", "artifact_uri", "seconds", "dataset", "task", "dataset_name", "dataset_split", "dataset_n_samples", "dataset_seed", "dataset_flags", "file_size"])
+|> DataFrame.put("index", for(n <- Range.new(1, DataFrame.n_rows(artifacts_ws)), do: Range.new(1, Enum.count(artifacts_ws["times"][n - 1])) |> Enum.to_list()))
+  |> DataFrame.put("family",
+  Series.transform(artifacts_ws["model"], fn model -> Map.get(families, model) end))  
+|> DataFrame.explode(["times", "tokens_in", "tokens_out", "index"])
+```
+
+```elixir
+artifacts_total = q
+|> DataFrame.concat_rows(q_ws)
+  |> DataFrame.mutate(
+    energy_per_prompt: tokens_out * (ground_truth_power_draw_total / n_tokens_out_total),
+    dyn_per_prompt: tokens_out * (power_draw_total / n_tokens_out_total),
+    stat_per_prompt: tokens_out * (static_energy_estimation_total / n_tokens_out_total)
+  )
+|> DataFrame.filter(energy_per_prompt > 0 and times > 0 and times < 900)
+|> DataFrame.sort_by(active_parameters)
+```
+
+```elixir
+artifacts_compact = artifacts_total
+|> DataFrame.group_by(["hardware", "model", "temperature", "field", "active_parameters", "index"])
+|> DataFrame.summarise(
+  energy_per_prompt: mean(energy_per_prompt), 
+  dyn_per_prompt: mean(dyn_per_prompt),
+  stat_per_prompt: mean(stat_per_prompt),
+  times: mean(times),
+  tokens_out: mean(tokens_out)
+  )
+|> DataFrame.filter(index <= 333)
+|> DataFrame.sort_by([hardware, active_parameters])
+```
+
+```elixir
+models = total_ground_truth
+  |> DataFrame.sort_by([active_parameters])
+  |> DataFrame.select("model")
+|> DataFrame.distinct()
+
+models_and_hardware = total_ground_truth
+  |> DataFrame.select("hardware")
+|> DataFrame.distinct()
+|> DataFrame.join(models, how: :cross)
+|> DataFrame.to_rows()
+  |> Enum.map(fn %{"model" => model, "hardware" => hardware} -> 
+    text = total_ground_truth
+    |> DataFrame.filter(model == ^model and hardware == ^hardware)
+    |> DataFrame.n_rows()
+    |> case do
+      0 -> "not tested"
+        _ -> nil
+    end
+
+    text = cond do
+      model == "llama4:scout" and hardware == "DGX Spark" -> "infeasible"
+      true -> text
+    end
+    
+    %{"model" => model, "hardware" => hardware, "text" => text}
+    end)
+|> DataFrame.new()
+```
+
+```elixir
+VegaLite.new()
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(artifacts_total,
+  only: ["model", "energy_per_prompt", "hardware", "active_parameters"]
+)
+  |> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: ["active_parameters"])
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "energy_per_prompt",
+  type: :quantitative,
+  scale: [type: :log]
+)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.data_from_values(models_and_hardware)
+  |> VegaLite.transform(filter: "datum.text != null")
+        |> VegaLite.mark(:text,
+          baseline: "top",
+          dy: -5,
+          angle: 270
+        )
+        |> VegaLite.encode_field(:x, "model", type: :nominal)
+  |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+        |> VegaLite.encode_field(:text, "text", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal)
+])
+```
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(artifacts_total,
+  only: ["model", "times", "hardware", "active_parameters"]
+)
+|> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: ["active_parameters"])
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "times",
+  type: :quantitative,
+  scale: [type: :log]
+)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal)
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.concat([
+  VegaLite.new()
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(artifacts_compact,
+  only: ["model", "energy_per_prompt", "hardware", "active_parameters"]
+)
+  |> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: ["active_parameters"], axis: nil, title: nil)
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "energy_per_prompt",
+  type: :quantitative,
+  scale: [type: :log, domain: [1, 500000]],
+  title: "Energy per request in J",
+  axis: [label_font_size: font_size, title_font_size: font_size]
+)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware", legend: [orient: :top]),
+  VegaLite.new()
+  |> VegaLite.data_from_values(models_and_hardware)
+  |> VegaLite.transform(filter: "datum.text != null")
+        |> VegaLite.mark(:text,
+          baseline: "top",
+          dy: -10,
+          angle: 270,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:x, "model", type: :nominal)
+  |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+        |> VegaLite.encode_field(:text, "text", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal)
+]),
+  VegaLite.new()
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(artifacts_compact,
+  only: ["model", "times", "hardware", "active_parameters"]
+)
+  |> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: ["active_parameters"], title: "Model",
+axis: [label_font_size: font_size, title_font_size: font_size])
+|> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+|> VegaLite.encode_field(:y, "times",
+  type: :quantitative,
+  scale: [type: :log, domain: [0.01, 1200]],
+  title: "Runtime per request in s",
+  axis: [label_font_size: font_size, title_font_size: font_size]
+)
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, legend: [label_font_size: font_size, title_font_size: font_size]),
+  VegaLite.new()
+  |> VegaLite.data_from_values(models_and_hardware)
+  |> VegaLite.transform(filter: "datum.text != null")
+        |> VegaLite.mark(:text,
+          baseline: "top",
+          dy: -10,
+          angle: 270,
+          font_size: font_size
+        )
+        |> VegaLite.encode_field(:x, "model", type: :nominal)
+  |> VegaLite.encode_field(:x_offset, "hardware", type: :nominal)
+        |> VegaLite.encode_field(:text, "text", type: :nominal)
+  |> VegaLite.encode_field(:color, "hardware", type: :nominal)
+])], :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/energyandruntime_per_model.pdf")
+
+vl
+```
+
+```elixir
+f = artifacts_total
+|> DataFrame.group_by(["hardware", "model"])
+|> DataFrame.summarise(
+  energy_stat: mean(stat_per_prompt), 
+  energy_dyn: mean(dyn_per_prompt), 
+  energy_ground: mean(energy_per_prompt),
+  power_stat: mean(stat_per_prompt) / mean(times),
+  power_dyn: mean(dyn_per_prompt) / mean(times),
+  power_ground: mean(energy_per_prompt) / mean(times)
+)
+|> DataFrame.mutate(
+  abs_error_dyn: abs(energy_ground - energy_dyn),
+  abs_error_stat: abs(energy_ground - energy_stat),
+  abs_error_ground: 0,
+  rel_error_dyn: ((energy_ground - energy_dyn) / energy_ground) * 100,
+  rel_error_stat: ((energy_ground - energy_stat) / energy_ground) * 100,
+  rel_error_ground: 0
+)
+```
+
+```elixir
+f1 = f 
+|> DataFrame.select(["hardware", "model", "energy_stat", "power_stat", "abs_error_stat", "rel_error_stat", "energy_ground"])
+|> DataFrame.rename(%{energy_stat: :energy, power_stat: :power, abs_error_stat: :abs_error, rel_error_stat: :rel_error, energy_ground: :ground})
+|> DataFrame.mutate(key_method: "Static")
+
+f2 = f 
+|> DataFrame.select(["hardware", "model", "energy_dyn", "power_dyn", "abs_error_dyn", "rel_error_dyn", "energy_ground"])
+|> DataFrame.rename(%{energy_dyn: :energy, power_dyn: :power, abs_error_dyn: :abs_error, rel_error_dyn: :rel_error, energy_ground: :ground})
+|> DataFrame.mutate(key_method: "Dynamic")
+
+f3 = f 
+|> DataFrame.select(["hardware", "model", "energy_ground", "power_ground", "abs_error_ground", "rel_error_ground"])
+|> DataFrame.rename(%{energy_ground: :energy, power_ground: :power, abs_error_ground: :abs_error, rel_error_ground: :rel_error})
+|> DataFrame.mutate(key_method: "Ground Truth", ground: energy)
+
+f = DataFrame.concat_rows([f1, f2, f3])
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.layers([
+  VegaLite.new()
+|> VegaLite.data_from_values(f)
+|> VegaLite.mark(:point)
+|> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")
+|> VegaLite.encode_field(:x, "ground", type: :quantitative, scale: [type: :log], title: "Ground Truth in J")
+|> VegaLite.encode_field(:y, "energy", type: :quantitative, scale: [type: :log], title: "Estimation in J")
+|> VegaLite.encode_field(:color, "hardware", type: :nominal, title: "Hardware")
+|> VegaLite.encode_field(:shape, "key_method", type: :nominal, title: "Estimation Method"),
+  VegaLite.new()
+  |> VegaLite.mark(:line, color: :black)
+  |> VegaLite.data_from_values(%{a: [100, 100000]})
+  |> VegaLite.encode_field(:x, "a", type: :quantitative, scale: [type: :log], title: "")
+  |> VegaLite.encode_field(:y, "a", type: :quantitative, scale: [type: :log], title: "")
+])
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/tracking_methods-scatterplot.pdf")
+
+vl
+```
+
+```elixir
+f = artifacts_total
+|> DataFrame.group_by(["hardware", "model", "temperature", "field", "dataset_model", "index"])
+|> DataFrame.summarise(
+  energy_stat: mean(stat_per_prompt), 
+  energy_dyn: mean(dyn_per_prompt), 
+  energy_ground: mean(energy_per_prompt),
+  power_stat: mean(stat_per_prompt) / mean(times),
+  power_dyn: mean(dyn_per_prompt) / mean(times),
+  power_ground: mean(energy_per_prompt) / mean(times)
+)
+|> DataFrame.mutate(
+  abs_error_dyn: abs(energy_ground - energy_dyn),
+  abs_error_stat: abs(energy_ground - energy_stat),
+  abs_error_ground: 0,
+  rel_error_dyn: ((energy_dyn - energy_ground) / energy_ground) * 100,
+  rel_error_stat: ((energy_stat - energy_ground) / energy_ground) * 100,
+  rel_error_ground: 0
+)
+```
+
+```elixir
+f1 = f 
+|> DataFrame.select(["hardware", "model", "energy_stat", "power_stat", "abs_error_stat", "rel_error_stat", "energy_ground"])
+|> DataFrame.rename(%{energy_stat: :energy, power_stat: :power, abs_error_stat: :abs_error, rel_error_stat: :rel_error, energy_ground: :ground})
+|> DataFrame.mutate(key_method: "Static", known_error_min: 0, known_error_max: 0)
+
+f2 = f 
+|> DataFrame.select(["hardware", "model", "energy_dyn", "power_dyn", "abs_error_dyn", "rel_error_dyn", "energy_ground"])
+|> DataFrame.rename(%{energy_dyn: :energy, power_dyn: :power, abs_error_dyn: :abs_error, rel_error_dyn: :rel_error, energy_ground: :ground})
+|> DataFrame.mutate(key_method: "Dynamic", known_error_min: -25, known_error_max: -15)
+
+f3 = f 
+|> DataFrame.select(["hardware", "model", "energy_ground", "power_ground", "abs_error_ground", "rel_error_ground"])
+|> DataFrame.rename(%{energy_ground: :energy, power_ground: :power, abs_error_ground: :abs_error, rel_error_ground: :rel_error})
+|> DataFrame.mutate(key_method: "Ground Truth", ground: energy, known_error_min: 0, known_error_max: 0)
+
+f = DataFrame.concat_rows([f1, f2, f3])
+```
+
+```elixir
+dyn_box = %{min: [-25], max: [-15]}
+```
+
+```elixir
+vl = VegaLite.new()
+  |> VegaLite.concat([
+    VegaLite.new(width: 400, height: 200)
+    |> VegaLite.layers([
+      VegaLite.new()
+      |> VegaLite.data_from_values(dyn_box)
+      |> VegaLite.mark(:rect, opacity: 0.2)
+        |> VegaLite.encode_field(:x, "min", type: :quantitative)
+      |> VegaLite.encode_field(:x2, "max", type: :quantitative),
+      VegaLite.new()
+      |> VegaLite.data_from_values(f,
+      only: ["model", "rel_error", "key_method", "hardware", "known_error_min", "known_error_max"]
+    )
+      |> VegaLite.mark(:boxplot)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'DGX Spark'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, title: "DGX Spark", axis: [label_font_size: font_size, title_font_size: font_size])
+    |> VegaLite.encode_field(:x, "rel_error", 
+      type: :quantitative, 
+      title: nil, 
+      axis: [
+        grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], 
+        label_expr: "datum.label + '%'",
+        label_font_size: font_size,
+        title_font_size: font_size
+      ],
+      scale: [
+        domain: [-62, 10]
+      ]
+    )
+    |> VegaLite.encode_field(:color, "key_method", type: :nominal)
+    ]),
+    VegaLite.new(width: 400, height: 200)
+    |> VegaLite.layers([
+      VegaLite.new()
+      |> VegaLite.data_from_values(dyn_box)
+      |> VegaLite.mark(:rect, opacity: 0.2)
+        |> VegaLite.encode_field(:x, "min", type: :quantitative)
+      |> VegaLite.encode_field(:x2, "max", type: :quantitative),
+      VegaLite.new()
+      |> VegaLite.data_from_values(f,
+      only: ["model", "rel_error", "key_method", "hardware", "known_error_min", "known_error_max"]
+    )
+    |> VegaLite.mark(:boxplot)
+    |> VegaLite.transform(filter: "datum.key_method != 'Ground Truth'")  
+    |> VegaLite.transform(filter: "datum.hardware == 'Workstation'")
+    |> VegaLite.encode_field(:y, "model", sort: "hardware", type: :nominal, title: "Workstation", axis: [label_font_size: font_size, title_font_size: font_size])
+    |> VegaLite.encode_field(:x, "rel_error", 
+      type: :quantitative, 
+      title: "Relative Error of Estimation Methods", 
+      axis: [
+        grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"], 
+        label_expr: "datum.label + '%'",
+        label_font_size: font_size,
+        title_font_size: font_size
+      ],
+      scale: [
+        domain: [-80, 90]
+      ]
+    )
+    |> VegaLite.encode_field(:color, "key_method", 
+      type: :nominal, 
+      title: "Estimation Method", 
+      legend: [orient: "bottom", label_font_size: font_size, title_font_size: font_size])
+    ])
+  ], :vertical)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/tracking_methods-relatives.pdf")
+
+vl
+```
+
+```elixir
+artifacts_sum = artifacts_total
+|> DataFrame.group_by(["hardware", "model"])
+|> DataFrame.summarise(
+  energy_per_prompt: mean(energy_per_prompt), 
+  active_parameters: first(active_parameters)
+)
+|> DataFrame.sort_by(active_parameters)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6ImJhciIsImNvbG9yX2ZpZWxkIjoiZ3JvdW5kX3RydXRoX3Bvd2VyX2RyYXciLCJjb2xvcl9maWVsZF9hZ2dyZWdhdGUiOm51bGwsImNvbG9yX2ZpZWxkX2JpbiI6bnVsbCwiY29sb3JfZmllbGRfc2NhbGVfc2NoZW1lIjpudWxsLCJjb2xvcl9maWVsZF90eXBlIjoicXVhbnRpdGF0aXZlIiwiZGF0YV92YXJpYWJsZSI6InRvdGFsX2dyb3VuZF90cnV0aCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6Im1vZGVsIiwieF9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInhfZmllbGRfYmluIjpudWxsLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInhfZmllbGRfdHlwZSI6Im5vbWluYWwiLCJ5X2ZpZWxkIjoiaGFyZHdhcmUiLCJ5X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieV9maWVsZF9iaW4iOm51bGwsInlfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieV9maWVsZF90eXBlIjoibm9taW5hbCJ9XSwidmxfYWxpYXMiOiJFbGl4aXIuVmVnYUxpdGUiLCJ3aWR0aCI6bnVsbH0","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["model", "hardware", "ground_truth_power_draw"]
+)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal)
+|> VegaLite.encode_field(:y, "hardware", type: :nominal)
+|> VegaLite.encode_field(:color, "ground_truth_power_draw", type: :quantitative)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6ImJhciIsImNvbG9yX2ZpZWxkIjoicnVubmluZ190aW1lX3RvdGFsIiwiY29sb3JfZmllbGRfYWdncmVnYXRlIjpudWxsLCJjb2xvcl9maWVsZF9iaW4iOm51bGwsImNvbG9yX2ZpZWxkX3NjYWxlX3NjaGVtZSI6bnVsbCwiY29sb3JfZmllbGRfdHlwZSI6InF1YW50aXRhdGl2ZSIsImRhdGFfdmFyaWFibGUiOiJ0b3RhbF9ncm91bmRfdHJ1dGgiLCJnZW9kYXRhX2NvbG9yIjoiYmx1ZSIsImxhdGl0dWRlX2ZpZWxkIjpudWxsLCJsb25naXR1ZGVfZmllbGQiOm51bGwsInhfZmllbGQiOiJtb2RlbCIsInhfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ4X2ZpZWxkX2JpbiI6bnVsbCwieF9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ4X2ZpZWxkX3R5cGUiOiJub21pbmFsIiwieV9maWVsZCI6ImZpZWxkIiwieV9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInlfZmllbGRfYmluIjpudWxsLCJ5X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInlfZmllbGRfdHlwZSI6Im5vbWluYWwifV0sInZsX2FsaWFzIjoiRWxpeGlyLlZlZ2FMaXRlIiwid2lkdGgiOm51bGx9","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(total_ground_truth,
+  only: ["model", "field", "running_time_total"]
+)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal)
+|> VegaLite.encode_field(:y, "field", type: :nominal)
+|> VegaLite.encode_field(:color, "running_time_total", type: :quantitative)
+```
+
+```elixir
+w = artifacts_total
+|> DataFrame.filter(times < 900 and tokens_out > 0 and model != "magistral:24b")
+```
+
+```elixir
+w
+|> DataFrame.summarise(mean_token: mean(tokens_out), median_token: median(tokens_out), 
+  min_token: min(tokens_out), max_token: max(tokens_out))
+```
+
+```elixir
+w
+|> DataFrame.summarise(mean_time: mean(times), median_time: median(times), 
+  min_time: min(times), max_time: max(times))
+```
+
+## Analysis with LMMs
+
+```elixir
+ww = w
+|> DataFrame.filter(tokens_out != 20480)
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.concat([
+  VegaLite.new(width: 250)
+|> VegaLite.data_from_values(w, only: ["times"])
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "times",
+  type: :quantitative,
+  bin: [maxbins: 500],
+  scale: [type: :symlog],
+  title: "Running time in s (binned)"
+)
+|> VegaLite.encode(:y, aggregate: :count, title: "Count of prompts"),
+VegaLite.new(width: 250)
+|> VegaLite.data_from_values(ww, only: ["tokens_out"])
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "tokens_out",
+  type: :quantitative,
+  bin: [maxbins: 500],
+  scale: [type: :symlog],
+  title: "Amount of generated token (binned)"
+)
+|> VegaLite.encode(:y, aggregate: :count, title: nil)
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/skew.pdf")
+
+vl
+```
+
+```elixir
+w["times"]
+|> Series.skew()
+```
+
+```elixir
+w["tokens_out"]
+|> Series.skew()
+```
+
+```elixir
+artifacts_total
+|> DataFrame.filter(times < 900 and tokens_out > 0 and model != "magistral:24b" and index <= 100)
+|> DataFrame.to_csv("#{base_path}/results/artifacts_total.csv")
+```
+
+### The next step has to be executed manually:
+
+1. Open the `lmm.py` in the `evaluation` folder
+2. Check for the correct formula and fitting of the model
+3. Execute `python lmm.py` in your bash (for Experiments with 1000 Prompts this may take up to one hour)
+4. Adjust the paths of the output files in the next cell accoring to your results
+5. Continue with this livebook
+
+```elixir
+lmm_result_list = [
+  #"#{base_path}/results/lmm_results/results/time-log-no-interaction-mixedlm_fixed_effects.csv",
+  #"#{base_path}/results/lmm_results/results/token-no-interaction-mixedlm_fixed_effects.csv",
+  #"#{base_path}/results/lmm_results/results/time-log-no-interaction-new.csv",
+  "#{base_path}/evaluation/mixedlm_fixed_effects.csv"
+]
+```
+
+```elixir
+lmm_result_list = lmm_result_list
+  |> Enum.map(fn path ->
+  path
+  |> DataFrame.from_csv!(delimiter: ";")
+  |> DataFrame.mutate(category: replace(category, "T.", ""))
+    |> DataFrame.mutate(category: replace(category, ", Treatment(reference='input')", ""))
+|> DataFrame.mutate(category: replace(category, ", Treatment(reference='Workstation')", ""))
+    |> DataFrame.mutate(category: replace(category, ", Treatment(reference='Gemma')", ""))
+    |> DataFrame.mutate(category: replace(category, ", Treatment(reference='Llama')", ""))
+    |> DataFrame.mutate(dimension: 
+      if contains(category, "field") do
+        "reformulation"
+      else
+        if contains(category, "model") do
+          "model"
+        else
+          if contains(category, "temperature") do
+            "temperature"
+          else
+            if contains(category, "hardware") do
+              "hardware"
+            else
+              if contains(category, "family") do
+                "hardware"
+              else
+                "LMM specific"
+              end
+            end
+          end
+        end
+      end,
+      significance: 
+      if p_value > 0.05 do 
+        "" 
+      else 
+        if p_value > 0.01 do
+          "*"
+        else
+          if p_value > 0.001 do
+            "**"
+          else
+            "***"
+          end
+        end
+      end
+      )
+    end)
+```
+
+```elixir
+vl = VegaLite.new()
+|> VegaLite.concat([
+  VegaLite.new(width: 250)
+|> VegaLite.data_from_values(Enum.at(lmm_result_list, 0), only: ["coefficient", "category", "dimension", "significance"])
+|> VegaLite.encode_field(:x, "coefficient", type: :quantitative, axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], title: "Running time (logarithmic)")
+|> VegaLite.encode_field(:y, "category", type: :nominal, title: "Category for fixed effect")
+  |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+  |> VegaLite.encode_field(:color, "dimension", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.coefficient >= 0")
+  |> VegaLite.mark(:text,
+    align: "left",
+    angle: 270,
+    dy: 10, dx: -5)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.coefficient < 0")
+  |> VegaLite.mark(:text,
+    align: "right",
+    angle: 90,
+    dx: 5, dy: 10)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+]),
+  VegaLite.new(width: 250)
+|> VegaLite.data_from_values(Enum.at(lmm_result_list, 0), only: ["coefficient", "category", "dimension", "significance"])
+|> VegaLite.encode_field(:x, "coefficient", type: :quantitative, scale: [domain: [-600, 1000]], axis: [grid_color: [condition: [test: "datum.value === 0", value: "black"], value: "#ddd"]], title: "Amount of generated token")
+|> VegaLite.encode_field(:y, "category", type: :nominal, axis: nil, title: nil)
+    |> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:color, "dimension", type: :nominal, title: "Dimension"),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.coefficient >= 0")
+  |> VegaLite.mark(:text,
+    align: "left",
+    angle: 270,
+    dy: 10, dx: -5)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal),
+  VegaLite.new()
+  |> VegaLite.transform(filter: "datum.coefficient < 0")
+  |> VegaLite.mark(:text,
+    align: "right",
+    angle: 90,
+    dx: 5, dy: 10)
+  |> VegaLite.encode_field(:text, "significance", type: :nominal)
+])
+], :horizontal)
+
+VegaLite.Convert.save!(vl, "#{base_path}/results/grafics/lmm-no-interaction.pdf")
+
+vl
+```
+
+```elixir
+lmm_result_list
+|> Enum.at(0)
+|> DataFrame.filter((ci_upper < 0 and ci_lower < 0) or (ci_upper > 0 and ci_lower > 0))
+```
